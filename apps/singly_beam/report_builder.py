@@ -39,6 +39,8 @@ def build_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults
     sections.append(_build_shear_section(inputs, results))
     if inputs.torsion.enabled:
         sections.append(_build_torsion_section(inputs, results))
+    if inputs.consider_deflection:
+        sections.append(_build_deflection_section(results))
     sections.append(_build_summary_section(inputs, results))
     return sections
 
@@ -128,6 +130,8 @@ def build_print_report_sections(inputs: BeamDesignInputSet, results: BeamDesignR
     )
     if inputs.torsion.enabled:
         sections.append(_build_print_torsion_section(results))
+    if inputs.consider_deflection:
+        sections.append(_build_print_deflection_section(results))
     sections.append(_build_print_design_summary(inputs, results))
     return sections
 
@@ -143,6 +147,8 @@ def build_full_report_sections(inputs: BeamDesignInputSet, results: BeamDesignRe
     ]
     if inputs.torsion.enabled:
         sections.append(_build_full_torsion_section(results))
+    if inputs.consider_deflection:
+        sections.append(_build_full_deflection_section(results))
     if inputs.has_negative_design and results.negative_bending is not None:
         sections.append(_build_full_negative_section(inputs, results))
     sections.extend(
@@ -1369,6 +1375,54 @@ def _build_full_spacing_section(inputs: BeamDesignInputSet, results: BeamDesignR
     return ReportSection(title="Reinforcement Spacing Checks", rows=rows)
 
 
+def _build_full_deflection_section(results: BeamDesignResults) -> ReportSection:
+    deflection = results.deflection
+    rows = [
+        ReportRow("Selected code", "-", deflection.code_version, deflection.code_version, "-"),
+        ReportRow("Member / Support", "-", f"{deflection.member_type} / {deflection.support_condition}", f"{deflection.member_type} / {deflection.support_condition}", "-"),
+        ReportRow("Ie method", "-", deflection.ie_method_selected, deflection.ie_method_governing, "-", note=deflection.governing_result),
+        ReportRow(
+            "Service loads",
+            "-",
+            f"DL (auto beam self-weight) = {format_number(deflection.service_dead_load_kgf_per_m)}, "
+            f"LL = {format_number(deflection.service_live_load_kgf_per_m)}, "
+            f"SDL = {format_number(deflection.additional_sustained_load_kgf_per_m)}",
+            f"{format_number(deflection.service_sustained_load_kgf_per_m)}",
+            "kgf/m",
+        ),
+        ReportRow("Allowable limit", "Delta_allow = L / limit", deflection.allowable_limit_label, format_number(deflection.allowable_deflection_cm), "cm", note=deflection.limit_clause),
+        ReportRow("Ie at midspan", "-", "-", format_number(deflection.ie_midspan_total_cm4), "cm^4", note=deflection.immediate_clause),
+        ReportRow("Ie at support", "-", "-", format_number(deflection.ie_support_total_cm4 or 0.0), "cm^4", note=deflection.immediate_clause),
+        ReportRow("Averaged Ie", "-", "-", format_number(deflection.ie_average_total_cm4 or 0.0), "cm^4", note=deflection.immediate_clause),
+        ReportRow("Deflection Method 1", "Midspan Ie only", "-", format_number(deflection.method_1_total_service_deflection_cm), "cm", note=deflection.immediate_clause),
+        ReportRow(
+            "Deflection Method 2",
+            "Averaged Ie (midspan + support)",
+            "-",
+            format_number(deflection.method_2_total_service_deflection_cm or 0.0),
+            "cm",
+            note=deflection.immediate_clause,
+        ),
+        ReportRow("Immediate total deflection", "-", format_number(deflection.immediate_total_deflection_cm), format_number(deflection.immediate_total_deflection_cm), "cm", note=deflection.immediate_clause),
+        ReportRow("Additional long-term deflection", "-", format_number(deflection.additional_long_term_deflection_cm), format_number(deflection.additional_long_term_deflection_cm), "cm", note=deflection.long_term_clause),
+        ReportRow("Total service deflection", "-", format_number(deflection.total_service_deflection_cm), format_number(deflection.total_service_deflection_cm), "cm", deflection.status),
+        ReportRow("Capacity Ratio (Deflection)", "Delta_calc / Delta_allow", f"{format_number(deflection.total_service_deflection_cm)} / {format_number(deflection.allowable_deflection_cm)}", format_ratio(deflection.capacity_ratio), "-", deflection.status),
+    ]
+    for index, step in enumerate(deflection.steps, start=1):
+        rows.append(
+            ReportRow(
+                f"Step {index}: {step.variable}",
+                step.equation,
+                step.substitution,
+                step.result,
+                step.units,
+                step.status,
+                step.clause,
+            )
+        )
+    return ReportSection(title="Deflection Check", rows=rows)
+
+
 def _build_full_warning_section(results: BeamDesignResults) -> ReportSection:
     rows = [
         ReportRow(f"Warning {index}", "-", message, message, "-", "Warning")
@@ -1425,6 +1479,17 @@ def _build_full_summary_section(inputs: BeamDesignInputSet, results: BeamDesignR
     if inputs.has_negative_design and results.negative_bending is not None:
         rows.append(
             ReportRow("Negative flexure, M<sub>u,neg</sub> / &phi;M<sub>n,neg</sub>", "-", f"M<sub>u,neg</sub> / &phi;M<sub>n,neg</sub> = {format_ratio(results.negative_bending.ratio)}", results.negative_bending.design_status, "-", results.negative_bending.as_status)
+        )
+    if inputs.consider_deflection:
+        rows.append(
+            ReportRow(
+                "Deflection",
+                "-",
+                f"Capacity Ratio (Deflection) = {format_ratio(results.deflection.capacity_ratio)} | Delta_allow = {format_number(results.deflection.allowable_deflection_cm)} cm",
+                results.deflection.status,
+                "-",
+                results.deflection.pass_fail_summary,
+            )
         )
     rows.extend(
         [
@@ -1547,6 +1612,18 @@ def _build_print_design_summary(inputs: BeamDesignInputSet, results: BeamDesignR
                 note=_print_flexural_summary_note(results.negative_bending.review_note),
             ),
         )
+    if inputs.consider_deflection:
+        rows.append(
+            ReportRow(
+                "Deflection",
+                "-",
+                f"Capacity Ratio (Deflection) = {format_ratio(results.deflection.capacity_ratio)}",
+                results.deflection.status,
+                "-",
+                status=f"Allowable = {format_number(results.deflection.allowable_deflection_cm)} cm",
+                note=results.deflection.pass_fail_summary or results.deflection.note,
+            )
+        )
     return ReportSection(title="Design Summary", rows=rows)
 
 
@@ -1572,6 +1649,43 @@ def _build_print_torsion_section(results: BeamDesignResults) -> ReportSection:
             ReportRow("At/s req.", "-", f"{torsion.transverse_reinf_required_mm2_per_mm:.6f}", f"{torsion.transverse_reinf_required_mm2_per_mm:.6f}", "mm2/mm"),
             ReportRow("Al req.", "-", format_number(mm2_to_cm2(torsion.longitudinal_reinf_required_mm2)), format_number(mm2_to_cm2(torsion.longitudinal_reinf_required_mm2)), "cm2"),
             ReportRow("Status", "-", torsion.pass_fail_summary, torsion.status, "-", torsion.status),
+        ],
+    )
+
+
+def _build_deflection_section(results: BeamDesignResults) -> ReportSection:
+    deflection = results.deflection
+    return ReportSection(
+        title="Deflection Check",
+        rows=[
+            ReportRow("Code", "-", deflection.code_version, deflection.code_version, "-"),
+            ReportRow("Member / Support", "-", f"{deflection.member_type} / {deflection.support_condition}", f"{deflection.member_type} / {deflection.support_condition}", "-"),
+            ReportRow("Ie method", "-", deflection.ie_method_selected, deflection.ie_method_governing, "-"),
+            ReportRow("Allowable", "-", deflection.allowable_limit_label, format_number(deflection.allowable_deflection_cm), "cm"),
+            ReportRow("Method 1", "Midspan Ie only", "-", format_number(deflection.method_1_total_service_deflection_cm), "cm"),
+            ReportRow("Method 2", "Averaged Ie", "-", format_number(deflection.method_2_total_service_deflection_cm or 0.0), "cm"),
+            ReportRow("Immediate total", "-", format_number(deflection.immediate_total_deflection_cm), format_number(deflection.immediate_total_deflection_cm), "cm"),
+            ReportRow("Long-term additional", "-", format_number(deflection.additional_long_term_deflection_cm), format_number(deflection.additional_long_term_deflection_cm), "cm"),
+            ReportRow("Total service", "-", format_number(deflection.total_service_deflection_cm), format_number(deflection.total_service_deflection_cm), "cm"),
+            ReportRow("Capacity Ratio (Deflection)", "-", format_ratio(deflection.capacity_ratio), format_ratio(deflection.capacity_ratio), "-", deflection.status),
+        ],
+    )
+
+
+def _build_print_deflection_section(results: BeamDesignResults) -> ReportSection:
+    deflection = results.deflection
+    return ReportSection(
+        title="Deflection Check",
+        rows=[
+            ReportRow("Code", "-", deflection.code_version, deflection.code_version, "-"),
+            ReportRow("Ie method", "-", deflection.ie_method_selected, deflection.ie_method_governing, "-"),
+            ReportRow("Allowable limit", "-", f"{deflection.allowable_limit_label} = {format_number(deflection.allowable_deflection_cm)} cm", format_number(deflection.allowable_deflection_cm), "cm"),
+            ReportRow("Method 1", "Midspan Ie only", "-", format_number(deflection.method_1_total_service_deflection_cm), "cm"),
+            ReportRow("Method 2", "Averaged Ie", "-", format_number(deflection.method_2_total_service_deflection_cm or 0.0), "cm"),
+            ReportRow("Immediate total", "-", format_number(deflection.immediate_total_deflection_cm), format_number(deflection.immediate_total_deflection_cm), "cm"),
+            ReportRow("Long-term additional", "-", format_number(deflection.additional_long_term_deflection_cm), format_number(deflection.additional_long_term_deflection_cm), "cm"),
+            ReportRow("Total service deflection", "-", format_number(deflection.total_service_deflection_cm), format_number(deflection.total_service_deflection_cm), "cm"),
+            ReportRow("Capacity Ratio (Deflection)", "-", format_ratio(deflection.capacity_ratio), format_ratio(deflection.capacity_ratio), "-", deflection.status, deflection.pass_fail_summary),
         ],
     )
 

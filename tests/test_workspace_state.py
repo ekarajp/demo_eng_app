@@ -3,6 +3,13 @@ from __future__ import annotations
 import apps.singly_beam.workspace_page as workspace_page
 from apps.singly_beam.models import BeamType, CombinedShearTorsionResults
 from core.theme import LIGHT_THEME
+from design.deflection import (
+    AllowableDeflectionPreset,
+    DeflectionCodeVersion,
+    DeflectionIeMethod,
+    DeflectionMemberType,
+    DeflectionSupportCondition,
+)
 from design.torsion import TorsionDesignCode
 from design.torsion.torsion_base import TorsionDemandType, TorsionDesignResults
 
@@ -46,6 +53,49 @@ def test_initialize_session_state_force_restores_values_when_returning_from_othe
     assert session_state["min_clear_spacing_cm"] == 3.5
 
 
+def test_initialize_session_state_resets_deflection_defaults_on_first_start(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = {
+        workspace_page.PERSISTED_WORKSPACE_STATE_KEY: {
+            "deflection_long_term_factor_x": 0.1,
+            "span_length_m": 8.0,
+            "deflection_allowable_limit_preset": "L/360",
+            "deflection_sustained_live_load_ratio": 0.9,
+        }
+    }
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page.initialize_session_state(default_inputs)
+
+    assert session_state["deflection_long_term_factor_x"] == 2.0
+    assert session_state["span_length_m"] == 1.0
+    assert session_state["deflection_allowable_limit_preset"] == "L/240"
+    assert session_state["deflection_sustained_live_load_ratio"] == 0.3
+    assert session_state["deflection_ie_method"] == "Conservative / Worst Case"
+
+
+def test_initialize_session_state_resets_deflection_defaults_when_version_changes(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = {
+        "deflection_long_term_factor_x": 0.1,
+        "span_length_m": 8.0,
+        "deflection_allowable_limit_preset": "L/360",
+        "deflection_sustained_live_load_ratio": 0.9,
+        workspace_page.DEFLECTION_DEFAULTS_VERSION_KEY: 1,
+    }
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page.initialize_session_state(default_inputs)
+
+    assert session_state["deflection_long_term_factor_x"] == 2.0
+    assert session_state["span_length_m"] == 1.0
+    assert session_state["deflection_allowable_limit_preset"] == "L/240"
+    assert session_state["deflection_sustained_live_load_ratio"] == 0.3
+    assert session_state[workspace_page.DEFLECTION_DEFAULTS_VERSION_KEY] == workspace_page.DEFLECTION_DEFAULTS_VERSION
+
+
 def test_initialize_session_state_does_not_override_existing_values_during_workspace_rerun(monkeypatch) -> None:
     default_inputs = workspace_page.load_default_inputs()
     session_state = {
@@ -60,6 +110,149 @@ def test_initialize_session_state_does_not_override_existing_values_during_works
     workspace_page.initialize_session_state(default_inputs, force_restore=False)
 
     assert session_state["width_cm"] == 28.0
+
+
+def test_build_default_state_sets_continuous_negative_rebar_startup_defaults() -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    state = workspace_page.build_default_state(default_inputs)
+
+    assert state["nb_tens_layer_1_group_a_diameter_option"] == 12
+    assert state["nb_tens_layer_1_group_a_diameter"] == 12
+    assert state["nb_tens_layer_1_group_a_count"] == 2
+    assert state["nb_tens_layer_1_group_b_diameter_option"] == "-"
+    assert state["nb_tens_layer_1_group_b_count"] == 0
+    assert state["nb_comp_layer_1_group_a_diameter_option"] == 12
+    assert state["nb_comp_layer_1_group_a_diameter"] == 12
+    assert state["nb_comp_layer_1_group_a_count"] == 2
+    assert state["nb_comp_layer_1_group_b_diameter_option"] == "-"
+    assert state["nb_comp_layer_1_group_b_count"] == 0
+    assert state["nb_tens_layer_2_group_a_diameter_option"] == "-"
+    assert state["nb_comp_layer_3_group_b_count"] == 0
+    assert state["deflection_ie_method"] == "Conservative / Worst Case"
+
+
+def test_handle_beam_type_change_preserves_user_negative_rebar_inputs(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["beam_type"] = "Continuous Beam"
+    session_state[workspace_page.CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] = True
+    session_state["nb_tens_layer_1_group_a_diameter_option"] = 20
+    session_state["nb_tens_layer_1_group_a_diameter"] = 20
+    session_state["nb_tens_layer_1_group_a_count"] = 4
+    session_state["nb_comp_layer_1_group_a_diameter_option"] = 16
+    session_state["nb_comp_layer_1_group_a_diameter"] = 16
+    session_state["nb_comp_layer_1_group_a_count"] = 3
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_beam_type_change()
+
+    assert session_state["nb_tens_layer_1_group_a_diameter_option"] == 20
+    assert session_state["nb_tens_layer_1_group_a_diameter"] == 20
+    assert session_state["nb_tens_layer_1_group_a_count"] == 4
+    assert session_state["nb_comp_layer_1_group_a_diameter_option"] == 16
+    assert session_state["nb_comp_layer_1_group_a_diameter"] == 16
+    assert session_state["nb_comp_layer_1_group_a_count"] == 3
+
+
+def test_handle_beam_type_change_applies_continuous_negative_rebar_defaults_on_first_switch(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["beam_type"] = "Continuous Beam"
+    session_state[workspace_page.CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] = False
+    for prefix in ("nb_tens", "nb_comp"):
+        session_state[f"{prefix}_layer_1_group_a_diameter_option"] = "-"
+        session_state[f"{prefix}_layer_1_group_a_diameter"] = 0
+        session_state[f"{prefix}_layer_1_group_a_count"] = 0
+        session_state[f"{prefix}_layer_1_group_b_diameter_option"] = "-"
+        session_state[f"{prefix}_layer_1_group_b_diameter"] = 0
+        session_state[f"{prefix}_layer_1_group_b_count"] = 0
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_beam_type_change()
+
+    assert session_state["nb_tens_layer_1_group_a_diameter_option"] == 12
+    assert session_state["nb_tens_layer_1_group_a_diameter"] == 12
+    assert session_state["nb_tens_layer_1_group_a_count"] == 2
+    assert session_state["nb_comp_layer_1_group_a_diameter_option"] == 12
+    assert session_state["nb_comp_layer_1_group_a_diameter"] == 12
+    assert session_state["nb_comp_layer_1_group_a_count"] == 2
+    assert session_state[workspace_page.CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] is True
+
+
+def test_handle_beam_type_change_restores_user_negative_rebar_after_simple_switch(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["beam_type"] = "Simple Beam"
+    session_state[workspace_page.CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] = True
+    session_state[workspace_page.NEGATIVE_REBAR_INPUT_BACKUP_KEY] = {
+        "nb_tens_layer_1_group_a_diameter_option": 20,
+        "nb_tens_layer_1_group_a_diameter": 20,
+        "nb_tens_layer_1_group_a_count": 4,
+        "nb_comp_layer_1_group_a_diameter_option": 16,
+        "nb_comp_layer_1_group_a_diameter": 16,
+        "nb_comp_layer_1_group_a_count": 3,
+        "negative_mu_kgm": 1250.0,
+    }
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    session_state["beam_type"] = "Continuous Beam"
+    workspace_page._handle_beam_type_change()
+
+    assert session_state["nb_tens_layer_1_group_a_diameter_option"] == 20
+    assert session_state["nb_tens_layer_1_group_a_diameter"] == 20
+    assert session_state["nb_tens_layer_1_group_a_count"] == 4
+    assert session_state["nb_comp_layer_1_group_a_diameter_option"] == 16
+    assert session_state["nb_comp_layer_1_group_a_diameter"] == 16
+    assert session_state["nb_comp_layer_1_group_a_count"] == 3
+    assert session_state["negative_mu_kgm"] == 1250.0
+
+
+def test_handle_beam_type_change_restores_last_continuous_deflection_ie_method(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["beam_type"] = "Continuous Beam"
+    session_state["deflection_ie_method"] = "Averaged Ie (midspan + support)"
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_beam_type_change()
+    assert session_state["deflection_ie_method"] == "Averaged Ie (midspan + support)"
+
+    session_state["beam_type"] = "Simple Beam"
+    workspace_page._handle_beam_type_change()
+    assert session_state[workspace_page.DEFLECTION_IE_METHOD_BACKUP_KEY] == "Averaged Ie (midspan + support)"
+
+    session_state["deflection_ie_method"] = "Midspan Ie only"
+    session_state["beam_type"] = "Continuous Beam"
+    workspace_page._handle_beam_type_change()
+
+    assert session_state["deflection_ie_method"] == "Averaged Ie (midspan + support)"
+
+
+def test_handle_beam_type_change_restores_worst_case_method_after_simple_switch(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["beam_type"] = "Continuous Beam"
+    session_state["deflection_ie_method"] = "Conservative / Worst Case"
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_beam_type_change()
+    session_state["beam_type"] = "Simple Beam"
+    workspace_page._handle_beam_type_change()
+    session_state["deflection_ie_method"] = "Midspan Ie only"
+    session_state["beam_type"] = "Continuous Beam"
+    workspace_page._handle_beam_type_change()
+
+    assert session_state["deflection_ie_method"] == "Conservative / Worst Case"
 
 
 def test_persist_session_state_snapshots_current_workspace_values(monkeypatch) -> None:
@@ -109,6 +302,322 @@ def test_build_inputs_from_state_preserves_consider_deflection_checkbox(monkeypa
     inputs = workspace_page.build_inputs_from_state()
 
     assert inputs.consider_deflection is True
+
+
+def test_build_default_state_uses_requested_deflection_defaults() -> None:
+    default_inputs = workspace_page.load_default_inputs()
+
+    state = workspace_page.build_default_state(default_inputs)
+
+    assert state["deflection_allowable_limit_preset"] == "L/240"
+    assert state["deflection_long_term_factor_x"] == 2.0
+    assert state["span_length_m"] == 1.0
+    assert state["deflection_sustained_live_load_ratio"] == 0.3
+    assert state["deflection_support_moment_mode"] == "Auto"
+
+
+def test_handle_consider_deflection_change_applies_defaults_on_first_enable(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["consider_deflection"] = True
+    session_state["deflection_sustained_live_load_ratio"] = 0.9
+    session_state["span_length_m"] = 8.0
+    session_state["deflection_long_term_factor_x"] = 0.1
+    session_state["deflection_allowable_limit_preset"] = "L/360"
+    session_state["deflection_ie_method"] = "Midspan Ie only"
+    session_state[workspace_page.DEFLECTION_FIRST_ENABLE_KEY] = False
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_consider_deflection_change()
+
+    assert session_state["deflection_sustained_live_load_ratio"] == 0.3
+    assert session_state["span_length_m"] == 1.0
+    assert session_state["deflection_long_term_factor_x"] == 2.0
+    assert session_state["deflection_allowable_limit_preset"] == "L/240"
+    assert session_state["deflection_ie_method"] == "Conservative / Worst Case"
+    assert session_state[workspace_page.DEFLECTION_FIRST_ENABLE_KEY] is True
+
+
+def test_handle_consider_deflection_change_sets_worst_case_for_continuous_beam_on_first_enable(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["beam_type"] = "Continuous Beam"
+    session_state["consider_deflection"] = True
+    session_state["deflection_support_condition"] = "Simple"
+    session_state["deflection_ie_method"] = "Midspan Ie only"
+    session_state[workspace_page.DEFLECTION_FIRST_ENABLE_KEY] = False
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_consider_deflection_change()
+
+    assert session_state["deflection_support_condition"] == "Continuous, 2 spans"
+    assert session_state["deflection_ie_method"] == "Conservative / Worst Case"
+
+
+def test_handle_consider_deflection_change_preserves_user_values_after_first_enable(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["consider_deflection"] = True
+    session_state["deflection_sustained_live_load_ratio"] = 0.45
+    session_state["span_length_m"] = 6.5
+    session_state["deflection_long_term_factor_x"] = 1.7
+    session_state["deflection_allowable_limit_preset"] = "L/480"
+    session_state[workspace_page.DEFLECTION_FIRST_ENABLE_KEY] = True
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._handle_consider_deflection_change()
+
+    assert session_state["deflection_sustained_live_load_ratio"] == 0.45
+    assert session_state["span_length_m"] == 6.5
+    assert session_state["deflection_long_term_factor_x"] == 1.7
+    assert session_state["deflection_allowable_limit_preset"] == "L/480"
+
+
+def test_build_inputs_from_state_maps_new_deflection_controls(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["consider_deflection"] = True
+    session_state["design_code"] = "ACI318-14"
+    session_state["width_cm"] = 25.0
+    session_state["depth_cm"] = 50.0
+    session_state["deflection_member_type"] = "Continuous beam"
+    session_state["deflection_support_condition"] = "Continuous, 2 spans"
+    session_state["deflection_ie_method"] = "Averaged Ie (midspan + support)"
+    session_state["deflection_allowable_limit_preset"] = "Custom"
+    session_state["deflection_allowable_limit_custom_denominator"] = 500
+    session_state["deflection_long_term_factor_x"] = 1.4
+    session_state["deflection_service_dead_load_kgf_per_m"] = 350.0
+    session_state["deflection_service_live_load_kgf_per_m"] = 180.0
+    session_state["deflection_additional_sustained_load_kgf_per_m"] = 40.0
+    session_state["deflection_sustained_live_load_ratio"] = 0.25
+    session_state["deflection_support_moment_mode"] = "Manual"
+    session_state["deflection_support_dead_load_service_moment_kgm"] = -1200.0
+    session_state["deflection_support_live_load_service_moment_kgm"] = -600.0
+    session_state["project_date_auto_value"] = "2026-03-29 12:15"
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    inputs = workspace_page.build_inputs_from_state()
+
+    assert inputs.deflection.design_code == DeflectionCodeVersion.ACI318_14
+    assert inputs.deflection.member_type == DeflectionMemberType.CONTINUOUS_BEAM
+    assert inputs.deflection.support_condition == DeflectionSupportCondition.CONTINUOUS_2_SPANS
+    assert inputs.deflection.ie_method == DeflectionIeMethod.AVERAGED
+    assert inputs.deflection.allowable_limit_preset == AllowableDeflectionPreset.CUSTOM
+    assert inputs.deflection.allowable_limit_custom_denominator == 500
+    assert inputs.deflection.long_term_factor_x == 1.4
+    assert inputs.deflection.service_dead_load_kgf_per_m == 300.0
+    assert inputs.deflection.service_live_load_kgf_per_m == 180.0
+    assert inputs.deflection.support_dead_load_service_moment_kgm == -1200.0
+    assert inputs.deflection.support_live_load_service_moment_kgm == -600.0
+
+
+def test_resolved_deflection_ie_method_preserves_continuous_selection_but_uses_midspan_for_simple(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["deflection_ie_method"] = "Conservative / Worst Case"
+    session_state["deflection_support_condition"] = "Simple"
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    assert workspace_page._resolved_deflection_ie_method_from_state() == DeflectionIeMethod.MIDSPAN_ONLY
+    assert session_state["deflection_ie_method"] == "Conservative / Worst Case"
+
+
+def test_deflection_support_moment_mode_is_preserved_when_ie_method_changes() -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    state = workspace_page.build_default_state(default_inputs)
+
+    assert state["deflection_support_moment_mode"] == "Auto"
+    state["deflection_support_moment_mode"] = "Manual"
+    state["deflection_ie_method"] = "Midspan Ie only"
+    state["deflection_ie_method"] = "Conservative / Worst Case"
+
+    assert state["deflection_support_moment_mode"] == "Manual"
+
+
+def test_deflection_support_input_visibility_restores_latest_support_input_state(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["deflection_support_moment_mode"] = "Manual"
+    session_state["deflection_support_dead_load_service_moment_kgm"] = -1200.0
+    session_state["deflection_support_live_load_service_moment_kgm"] = -600.0
+    session_state[workspace_page.DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY] = True
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    workspace_page._leave_deflection_support_input_visibility()
+    session_state["deflection_support_moment_mode"] = "Auto"
+    session_state["deflection_support_dead_load_service_moment_kgm"] = 0.0
+    session_state["deflection_support_live_load_service_moment_kgm"] = 0.0
+
+    workspace_page._enter_deflection_support_input_visibility()
+
+    assert session_state["deflection_support_moment_mode"] == "Manual"
+    assert session_state["deflection_support_dead_load_service_moment_kgm"] == -1200.0
+    assert session_state["deflection_support_live_load_service_moment_kgm"] == -600.0
+
+
+def test_build_inputs_from_state_auto_estimates_deflection_support_moments(monkeypatch) -> None:
+    default_inputs = workspace_page.load_default_inputs()
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(workspace_page.build_default_state(default_inputs))
+    session_state["consider_deflection"] = True
+    session_state["beam_type"] = "Continuous Beam"
+    session_state["design_code"] = "ACI318-19"
+    session_state["width_cm"] = 25.0
+    session_state["depth_cm"] = 50.0
+    session_state["deflection_member_type"] = "Continuous beam"
+    session_state["deflection_support_condition"] = "Continuous, 2 spans"
+    session_state["span_length_m"] = 10.0
+    session_state["deflection_additional_sustained_load_kgf_per_m"] = 40.0
+    session_state["deflection_service_live_load_kgf_per_m"] = 180.0
+    session_state["deflection_support_moment_mode"] = "Auto"
+    session_state["deflection_support_dead_load_service_moment_kgm"] = -1.0
+    session_state["deflection_support_live_load_service_moment_kgm"] = -1.0
+    session_state["project_date_auto_value"] = "2026-03-29 12:15"
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    inputs = workspace_page.build_inputs_from_state()
+
+    assert inputs.deflection.support_dead_load_service_moment_kgm == -4250.0
+    assert inputs.deflection.support_live_load_service_moment_kgm == -2250.0
+
+
+def test_deflection_info_texts_follow_selected_project_code(monkeypatch) -> None:
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update({"design_code": "ACI318-19"})
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    long_term_text = workspace_page._deflection_long_term_x_info_text()
+    limit_text = workspace_page._deflection_limit_info_text()
+    service_text = workspace_page._deflection_service_load_info_text()
+
+    assert "ACI318-19 - Chapter 24.2.4" in long_term_text
+    assert "L/240 (default)" in limit_text
+    assert "ACI318-19 - Chapter 24 gives the serviceability framework for deflection checks in the selected code version." in limit_text
+    assert "L/240: common general building limit where moderate deflection control is needed." in limit_text
+    assert "L/480: tighter architectural/serviceability control for more sensitive finishes." in limit_text
+    assert "are engineering guidance in this app and are not directly assigned to these exact ratios by the selected ACI code text." in limit_text
+    assert "Simple beam: L = serviceability span length of the simple span being checked." in limit_text
+    assert "w_sustained = DL_auto + SDL + (Sustained LL ratio x Service LL)" in service_text
+    assert "Sustained LL ratio is the portion of service live load treated as sustained" in service_text
+    assert "Strength design for Mu and Vu remains based on the user-entered factored actions." in service_text
+    assert "Startup default in this app = 0.30." in service_text
+    assert "This is not the same as SDL." in service_text
+
+
+def test_simple_beam_deflection_support_options_remain_single_value() -> None:
+    options = workspace_page._deflection_support_options_for_member_type("Simple beam")
+
+    assert options == ["Simple"]
+
+
+def test_deflection_reference_diagram_marks_simple_midspan(monkeypatch) -> None:
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update({"deflection_support_condition": "Simple"})
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    html = workspace_page._deflection_reference_diagram_html()
+
+    assert "Simple beam: maximum deflection is checked at midspan." in html
+    assert "Max deflection check point" in html
+    assert "deflection-support-triangle" in html
+    assert "max-width:520px" in html
+    assert "fill:#111111" in html
+    assert "\n        <polygon" not in html
+
+
+def test_deflection_reference_diagram_marks_continuous_representative_span(monkeypatch) -> None:
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update({"deflection_support_condition": "Continuous, 3 or more spans"})
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    html = workspace_page._deflection_reference_diagram_html()
+
+    assert (
+        "Continuous 3 or more spans: the module checks both Ie at the interior representative span midspan and "
+        "representative Ie,avg, then uses the larger deflection."
+    ) in html
+    assert "Span 2" in html
+
+
+def test_deflection_reference_diagram_keeps_triangle_supports_for_continuous_case(monkeypatch) -> None:
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update(
+        {
+            "deflection_support_condition": "Continuous, 2 spans",
+            "deflection_support_dead_load_service_moment_kgm": 50.0,
+            "deflection_support_live_load_service_moment_kgm": 25.0,
+        }
+    )
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    html = workspace_page._deflection_reference_diagram_html()
+
+    assert "deflection-support-fixed-wall" not in html
+    assert html.count("<polygon class='deflection-support-triangle'") == 3
+
+
+def test_deflection_reference_diagram_uses_preview_results_in_note(monkeypatch) -> None:
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update({"deflection_support_condition": "Simple"})
+    preview_results = type(
+        "PreviewResults",
+        (),
+        {
+            "deflection": type(
+                "DeflectionResult",
+                (),
+                {"total_service_deflection_cm": 1.25, "allowable_deflection_cm": 2.5},
+            )()
+        },
+    )()
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    html = workspace_page._deflection_reference_diagram_html(preview_results)
+
+    assert "Total service deflection = 1.25 cm, allowable = 2.50 cm." in html
+    assert "&#916;max = 1.25 cm" in html
+
+
+def test_deflection_reference_diagram_summary_mode_shows_legend_without_delta_marker(monkeypatch) -> None:
+    session_state = type("SessionState", (dict,), {"__getattr__": dict.__getitem__, "__setattr__": dict.__setitem__})()
+    session_state.update({"deflection_support_condition": "Simple"})
+    preview_results = type(
+        "PreviewResults",
+        (),
+        {
+            "deflection": type(
+                "DeflectionResult",
+                (),
+                {"total_service_deflection_cm": 1.25, "allowable_deflection_cm": 2.5},
+            )()
+        },
+    )()
+
+    monkeypatch.setattr(workspace_page.st, "session_state", session_state)
+
+    html = workspace_page._deflection_reference_diagram_html(preview_results, summary_mode=True, palette=LIGHT_THEME)
+
+    assert "Calculated deflection shape" in html
+    assert "Allowable limit shape" in html
+    assert "&#916;max" not in html
 
 
 def test_sync_layer_group_counts_resets_middle_bar_count_when_diameter_is_empty(monkeypatch) -> None:

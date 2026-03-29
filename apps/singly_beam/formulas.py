@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import math
 
+from design.deflection import (
+    DeflectionDesignInput as EngineDeflectionDesignInput,
+    DeflectionMemberType as EngineDeflectionMemberType,
+    DeflectionSectionReinforcementInput as EngineDeflectionSectionReinforcementInput,
+    DeflectionServiceLoadInput as EngineDeflectionServiceLoadInput,
+    DeflectionSupportCondition as EngineDeflectionSupportCondition,
+    design_deflection_check,
+)
 from design.torsion import (
     TorsionDesignResults,
     TorsionDesignMaterialInput,
@@ -203,20 +211,61 @@ def calculate_negative_bending_design(
 
 
 def calculate_deflection_check(
-    materials: MaterialPropertiesInput,
-    geometry: BeamGeometryInput,
-    positive_bending: PositiveBendingInput,
-    negative_bending: NegativeBendingInput,
-    deflection: DeflectionCheckInput,
+    design_inputs: BeamDesignInputSet,
+    material_results: MaterialResults,
+    geometry_results: BeamGeometryResults,
 ) -> DeflectionCheckResults:
-    return DeflectionCheckResults(
-        status="Needs manual engineering review",
-        note=(
-            "Deflection logic has not been fully reconstructed into code yet. "
-            "Use a separate checked procedure until this module is completed."
-        ),
-        verification_status=VerificationStatus.NEEDS_REVIEW,
+    beam_self_weight_dead_load_kgf_per_m = (
+        (design_inputs.geometry.width_cm / 100.0) * (design_inputs.geometry.depth_cm / 100.0) * 2400.0
     )
+    support_section = None
+    if design_inputs.deflection.support_condition in {
+        EngineDeflectionSupportCondition.CONTINUOUS_2_SPANS,
+        EngineDeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS,
+    }:
+        if geometry_results.d_minus_cm is None or geometry_results.negative_compression_centroid_from_bottom_cm is None:
+            raise ValueError("Continuous-beam deflection checks require negative-moment reinforcement geometry.")
+        support_section = EngineDeflectionSectionReinforcementInput(
+            tension_as_cm2=design_inputs.negative_bending.tension_reinforcement.total_area_cm2,
+            compression_as_cm2=design_inputs.negative_bending.compression_reinforcement.total_area_cm2,
+            effective_depth_cm=geometry_results.d_minus_cm,
+            compression_depth_cm=geometry_results.negative_compression_centroid_from_bottom_cm,
+        )
+
+    engine_results = design_deflection_check(
+        EngineDeflectionDesignInput(
+            code_version=design_inputs.deflection.design_code,
+            member_type=design_inputs.deflection.member_type,
+            support_condition=design_inputs.deflection.support_condition,
+            ie_method=design_inputs.deflection.ie_method,
+            allowable_limit=design_inputs.deflection.allowable_limit,
+            span_length_m=design_inputs.deflection.span_length_m,
+            long_term_factor_x=design_inputs.deflection.long_term_factor_x,
+            width_cm=design_inputs.geometry.width_cm,
+            depth_cm=design_inputs.geometry.depth_cm,
+            gross_moment_of_inertia_cm4=geometry_results.gross_moment_of_inertia_cm4,
+            concrete_strength_ksc=design_inputs.materials.concrete_strength_ksc,
+            ec_ksc=material_results.ec_ksc,
+            fr_ksc=material_results.modulus_of_rupture_fr_ksc,
+            modular_ratio_n=material_results.modular_ratio_n,
+            service_loads=EngineDeflectionServiceLoadInput(
+                dead_load_kgf_per_m=beam_self_weight_dead_load_kgf_per_m,
+                live_load_kgf_per_m=design_inputs.deflection.service_live_load_kgf_per_m,
+                additional_sustained_load_kgf_per_m=design_inputs.deflection.additional_sustained_load_kgf_per_m,
+                sustained_live_load_ratio=design_inputs.deflection.sustained_live_load_ratio,
+                support_dead_load_service_moment_kgm=design_inputs.deflection.support_dead_load_service_moment_kgm,
+                support_live_load_service_moment_kgm=design_inputs.deflection.support_live_load_service_moment_kgm,
+            ),
+            midspan_section=EngineDeflectionSectionReinforcementInput(
+                tension_as_cm2=design_inputs.positive_bending.tension_reinforcement.total_area_cm2,
+                compression_as_cm2=design_inputs.positive_bending.compression_reinforcement.total_area_cm2,
+                effective_depth_cm=geometry_results.d_plus_cm,
+                compression_depth_cm=geometry_results.positive_compression_centroid_d_prime_cm,
+            ),
+            support_section=support_section,
+        )
+    )
+    return _to_app_deflection_results(engine_results)
 
 
 def _deflection_not_considered_result() -> DeflectionCheckResults:
@@ -331,6 +380,39 @@ def validate_torsion_warnings(torsion_results: TorsionDesignResults) -> list[str
     return [_formalize_torsion_warning(message, torsion_results) for message in torsion_results.warnings]
 
 
+def validate_deflection_warnings(
+    deflection_results: DeflectionCheckResults,
+    *,
+    consider_deflection: bool,
+) -> list[str]:
+    if not consider_deflection:
+        return []
+    warnings: list[str] = []
+    if deflection_results.status == "FAIL":
+        warnings.append(
+            f"{deflection_results.pass_fail_summary} "
+            f"{_format_aci_warning_reference(deflection_results.limit_clause)}. "
+            "This does not satisfy the selected serviceability deflection limit."
+        )
+    elif deflection_results.mockup_only:
+        warnings.append(deflection_results.note)
+    for warning in deflection_results.warnings:
+        if warning == deflection_results.pass_fail_summary:
+            continue
+        if "licensed code text" in warning:
+            warnings.append(f"{warning.rstrip('.')} This should be confirmed by the design engineer.")
+        elif "load-free" in warning or "live load is zero" in warning:
+            warnings.append(f"{warning.rstrip('.')} This is an input-condition notice for the serviceability check.")
+        elif warning == deflection_results.note:
+            warnings.append(warning)
+        else:
+            warnings.append(
+                f"{warning.rstrip('.')} {_format_aci_warning_reference(deflection_results.long_term_clause)}. "
+                "This should be confirmed by the design engineer."
+            )
+    return warnings
+
+
 def _compose_combined_shear_torsion_results(
     design_inputs: BeamDesignInputSet,
     shear_results: ShearDesignResults,
@@ -385,10 +467,12 @@ def _compose_combined_shear_torsion_results(
         )
 
     d_mm = design_inputs.geometry.depth_cm * 10.0
+    # Convert the shear demand to the same shared-stirrup basis used elsewhere in this block: mm2/mm.
+    # fy is entered in kgf/cm2, so the raw Av/s result is first obtained in cm2/mm and then converted to mm2/mm.
     shear_required_transverse_mm2_per_mm = _safe_divide(
         shear_results.nominal_vs_required_kg,
         design_inputs.materials.shear_steel_yield_ksc * d_mm,
-    )
+    ) * 100.0
     # Shared-stirrup summary basis:
     # - shear demand is expressed as total vertical-leg area per spacing, Av/s
     # - torsion At/s is converted to the same shared closed-stirrup basis by multiplying by the number of vertical legs
@@ -540,11 +624,9 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
         )
     deflection_results = (
         calculate_deflection_check(
-            design_inputs.materials,
-            design_inputs.geometry,
-            design_inputs.positive_bending,
-            design_inputs.negative_bending,
-            design_inputs.deflection,
+            design_inputs,
+            material_results,
+            geometry_results,
         )
         if design_inputs.consider_deflection
         else _deflection_not_considered_result()
@@ -567,6 +649,7 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
         ),
         *validate_shear_warnings(design_inputs, shear_results),
         *validate_torsion_warnings(torsion_results),
+        *validate_deflection_warnings(deflection_results, consider_deflection=design_inputs.consider_deflection),
     ]
     warnings = [_formalize_general_warning(message, design_inputs.metadata.design_code) for message in warnings]
     review_flags = _build_review_flags(negative_results, deflection_results, consider_deflection=design_inputs.consider_deflection)
@@ -578,6 +661,7 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
         torsion_results,
         combined_shear_torsion_results,
         negative_results,
+        deflection_results,
         review_flags,
     )
     return BeamDesignResults(
@@ -788,6 +872,70 @@ def _to_app_shear_results(engine_results) -> ShearDesignResults:
     )
 
 
+def _to_app_deflection_results(engine_results) -> DeflectionCheckResults:
+    verification_status = (
+        VerificationStatus.NEEDS_REVIEW
+        if getattr(engine_results, "verification_status", "").value == "Needs manual engineering review"
+        else VerificationStatus.VERIFIED_CODE
+    )
+    return DeflectionCheckResults(
+        status=engine_results.status,
+        note=engine_results.note,
+        verification_status=verification_status,
+        code_version=engine_results.code_version,
+        member_type=engine_results.member_type,
+        support_condition=engine_results.support_condition,
+        ie_method_selected=engine_results.ie_method_selected,
+        ie_method_governing=engine_results.ie_method_governing,
+        allowable_limit_label=engine_results.allowable_limit_label,
+        allowable_limit_denominator=engine_results.allowable_limit_denominator,
+        allowable_deflection_cm=engine_results.allowable_deflection_cm,
+        span_length_m=engine_results.span_length_m,
+        load_basis_note=engine_results.load_basis_note,
+        pass_fail_summary=engine_results.pass_fail_summary,
+        mockup_only=engine_results.mockup_only,
+        immediate_clause=engine_results.immediate_clause,
+        long_term_clause=engine_results.long_term_clause,
+        limit_clause=engine_results.limit_clause,
+        service_dead_load_kgf_per_m=engine_results.service_dead_load_kgf_per_m,
+        service_live_load_kgf_per_m=engine_results.service_live_load_kgf_per_m,
+        additional_sustained_load_kgf_per_m=engine_results.additional_sustained_load_kgf_per_m,
+        sustained_live_load_ratio=engine_results.sustained_live_load_ratio,
+        service_sustained_load_kgf_per_m=engine_results.service_sustained_load_kgf_per_m,
+        midspan_dead_load_service_moment_kgm=engine_results.midspan_dead_load_service_moment_kgm,
+        midspan_live_load_service_moment_kgm=engine_results.midspan_live_load_service_moment_kgm,
+        support_dead_load_service_moment_kgm=engine_results.support_dead_load_service_moment_kgm,
+        support_live_load_service_moment_kgm=engine_results.support_live_load_service_moment_kgm,
+        gross_moment_of_inertia_cm4=engine_results.gross_moment_of_inertia_cm4,
+        midspan_cracking_moment_kgm=engine_results.midspan_cracking_moment_kgm,
+        support_cracking_moment_kgm=engine_results.support_cracking_moment_kgm,
+        midspan_cracked_neutral_axis_cm=engine_results.midspan_cracked_neutral_axis_cm,
+        support_cracked_neutral_axis_cm=engine_results.support_cracked_neutral_axis_cm,
+        midspan_cracked_inertia_cm4=engine_results.midspan_cracked_inertia_cm4,
+        support_cracked_inertia_cm4=engine_results.support_cracked_inertia_cm4,
+        ie_midspan_total_cm4=engine_results.ie_midspan_total_cm4,
+        ie_support_total_cm4=engine_results.ie_support_total_cm4,
+        ie_average_total_cm4=engine_results.ie_average_total_cm4,
+        ie_dead_cm4=engine_results.ie_dead_cm4,
+        ie_total_cm4=engine_results.ie_total_cm4,
+        ie_sustained_cm4=engine_results.ie_sustained_cm4,
+        method_1_total_service_deflection_cm=engine_results.method_1_total_service_deflection_cm,
+        method_2_total_service_deflection_cm=engine_results.method_2_total_service_deflection_cm,
+        immediate_dead_deflection_cm=engine_results.immediate_dead_deflection_cm,
+        immediate_total_deflection_cm=engine_results.immediate_total_deflection_cm,
+        immediate_live_deflection_cm=engine_results.immediate_live_deflection_cm,
+        sustained_initial_deflection_cm=engine_results.sustained_initial_deflection_cm,
+        long_term_multiplier=engine_results.long_term_multiplier,
+        additional_long_term_deflection_cm=engine_results.additional_long_term_deflection_cm,
+        total_service_deflection_cm=engine_results.total_service_deflection_cm,
+        calculated_deflection_cm=engine_results.calculated_deflection_cm,
+        capacity_ratio=engine_results.capacity_ratio,
+        governing_result=engine_results.governing_result,
+        warnings=engine_results.warnings,
+        steps=engine_results.steps,
+    )
+
+
 def _build_review_flags(
     negative_results: FlexuralDesignResults | None,
     deflection_results: DeflectionCheckResults,
@@ -795,7 +943,7 @@ def _build_review_flags(
     consider_deflection: bool,
 ) -> list[ReviewFlag]:
     review_flags: list[ReviewFlag] = []
-    if not consider_deflection:
+    if not consider_deflection or deflection_results.verification_status != VerificationStatus.NEEDS_REVIEW:
         return review_flags
     review_flags.append(
         ReviewFlag(
@@ -816,6 +964,7 @@ def _calculate_overall_assessment(
     torsion_results: TorsionDesignResults,
     combined_shear_torsion_results: CombinedShearTorsionResults,
     negative_results: FlexuralDesignResults | None,
+    deflection_results: DeflectionCheckResults,
     review_flags: list[ReviewFlag],
 ) -> tuple[str, str]:
     strength_failures: list[str] = []
@@ -858,6 +1007,8 @@ def _calculate_overall_assessment(
     # It is not itself a design warning and must not drive the overall status.
     if torsion_results.enabled and torsion_results.warnings:
         requirement_issues.extend(torsion_results.warnings)
+    if design_inputs.consider_deflection and deflection_results.status == "FAIL":
+        requirement_issues.append(deflection_results.pass_fail_summary)
     if requirement_issues:
         return "DOES NOT MEET REQUIREMENTS", " ".join(requirement_issues)
 
@@ -1075,12 +1226,13 @@ def _calculate_av_min_per_spacing_cm(sqrt_fc: float, width_cm: float, fy_ksc: fl
 
 
 def _auto_select_spacing_cm(required_spacing_cm: float, increment_cm: float = AUTO_SHEAR_SPACING_INCREMENT_CM) -> float:
+    minimum_auto_spacing_cm = 5.0
     if not math.isfinite(required_spacing_cm):
-        return increment_cm
+        return max(increment_cm, minimum_auto_spacing_cm)
     snapped_spacing_cm = math.floor(required_spacing_cm / increment_cm) * increment_cm
     if snapped_spacing_cm > 0:
-        return snapped_spacing_cm
-    return required_spacing_cm
+        return max(snapped_spacing_cm, minimum_auto_spacing_cm)
+    return max(required_spacing_cm, minimum_auto_spacing_cm)
 
 
 def _resolve_shared_stirrup_spacing_cm(
@@ -1104,10 +1256,11 @@ def _combined_required_transverse_mm2_per_mm(
     torsion_results: TorsionDesignResults,
 ) -> float:
     d_mm = design_inputs.geometry.depth_cm * 10.0
+    # Keep the shear component on the same mm2/mm basis as the torsion component for shared-stirrup interaction.
     shear_required_transverse_mm2_per_mm = _safe_divide(
         shear_results.nominal_vs_required_kg,
         design_inputs.materials.shear_steel_yield_ksc * d_mm,
-    )
+    ) * 100.0
     torsion_required_transverse_mm2_per_mm = (
         torsion_results.transverse_reinf_required_mm2_per_mm * design_inputs.shear.legs_per_plane
     )

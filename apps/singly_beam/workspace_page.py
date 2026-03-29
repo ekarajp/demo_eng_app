@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import math
+from textwrap import dedent
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
+from design.deflection import (
+    AllowableDeflectionPreset,
+    DeflectionCodeVersion,
+    DeflectionIeMethod,
+    DeflectionMemberType,
+    DeflectionSupportCondition,
+)
+from design.deflection.deflection_report import deflection_workspace_summary_lines
 from design.torsion import TorsionDemandType, TorsionDesignCode, TorsionDesignInput
 from design.torsion.torsion_report import torsion_workspace_summary_lines
 from core.theme import (
+    LIGHT_THEME,
     apply_theme,
     capacity_ratio_html,
     capacity_ratio_legend_html,
@@ -62,6 +73,16 @@ BAR_DIAMETER_OPTIONS: list[object] = [6, 9, 10, 12, 16, 20, 25, 28, 32, 40, "Cus
 PERSISTED_WORKSPACE_STATE_KEY = "_persisted_workspace_state"
 LAST_RENDERED_PAGE_KEY = "_last_rendered_page"
 TORSION_INPUT_BACKUP_KEY = "_torsion_input_backup"
+DEFLECTION_DEFAULTS_VERSION_KEY = "_deflection_defaults_version"
+DEFLECTION_DEFAULTS_VERSION = 3
+DEFLECTION_FIRST_ENABLE_KEY = "_deflection_first_enable_applied"
+CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY = "_continuous_negative_defaults_applied"
+NEGATIVE_REBAR_INPUT_BACKUP_KEY = "_negative_rebar_input_backup"
+DEFLECTION_IE_METHOD_BACKUP_KEY = "_deflection_ie_method_backup"
+DEFLECTION_SUPPORT_INPUT_BACKUP_KEY = "_deflection_support_input_backup"
+DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY = "_deflection_support_input_visible"
+NORMAL_WEIGHT_CONCRETE_UNIT_WEIGHT_KGF_PER_M3 = 2400.0
+DEFLECTION_SUPPORT_MOMENT_MODE_OPTIONS = ("Auto", "Manual")
 TORSION_DEMAND_TYPE_INFO_TEXT = (
     "Use 'equilibrium torsion' when torsion is required to maintain static equilibrium of the member "
     "or structural system.\n\n"
@@ -70,8 +91,6 @@ TORSION_DEMAND_TYPE_INFO_TEXT = (
     "Therefore, if the torsion type is uncertain, 'equilibrium torsion' should be selected, as it is "
     "the safer and more conservative design assumption."
 )
-
-
 @st.cache_data(show_spinner=False)
 def load_default_inputs() -> BeamDesignInputSet:
     return default_beam_design_inputs()
@@ -112,6 +131,9 @@ def initialize_session_state(default_inputs: BeamDesignInputSet, *, force_restor
     st.session_state.setdefault("project_date_auto_value", _current_timestamp_text())
     for key, value in default_state.items():
         st.session_state.setdefault(key, value)
+    _initialize_deflection_defaults_once(default_state)
+    st.session_state.setdefault(DEFLECTION_FIRST_ENABLE_KEY, bool(st.session_state.get("consider_deflection", False)))
+    st.session_state.setdefault(CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY, False)
 
 
 def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
@@ -156,6 +178,20 @@ def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
         "torsion_longitudinal_fy_ksc": float(inputs.torsion.provided_longitudinal_bar_fy_ksc),
         "torsion_longitudinal_count": inputs.torsion.provided_longitudinal_bar_count,
         "consider_deflection": inputs.consider_deflection,
+        "deflection_design_code": inputs.deflection.design_code.value,
+        "deflection_member_type": inputs.deflection.member_type.value,
+        "deflection_support_condition": inputs.deflection.support_condition.value,
+        "deflection_ie_method": inputs.deflection.ie_method.value,
+        "deflection_allowable_limit_preset": inputs.deflection.allowable_limit_preset.value,
+        "deflection_allowable_limit_custom_denominator": inputs.deflection.allowable_limit_custom_denominator or 500,
+        "deflection_long_term_factor_x": inputs.deflection.long_term_factor_x,
+        "deflection_service_dead_load_kgf_per_m": inputs.deflection.service_dead_load_kgf_per_m,
+        "deflection_service_live_load_kgf_per_m": inputs.deflection.service_live_load_kgf_per_m,
+        "deflection_additional_sustained_load_kgf_per_m": inputs.deflection.additional_sustained_load_kgf_per_m,
+        "deflection_sustained_live_load_ratio": inputs.deflection.sustained_live_load_ratio,
+        "deflection_support_moment_mode": "Auto",
+        "deflection_support_dead_load_service_moment_kgm": inputs.deflection.support_dead_load_service_moment_kgm,
+        "deflection_support_live_load_service_moment_kgm": inputs.deflection.support_live_load_service_moment_kgm,
         "deflection_beam_type": inputs.deflection.beam_type.value,
         "beam_type_factor_x": inputs.deflection.beam_type_factor_x,
         "span_length_m": inputs.deflection.span_length_m,
@@ -181,6 +217,20 @@ def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
             state[f"{prefix}_layer_{layer_index}_group_b_diameter_option"] = _diameter_option(layer.group_b.diameter_mm, allow_empty=True)
             state[f"{prefix}_layer_{layer_index}_group_b_diameter"] = layer.group_b.diameter_mm or 0
             state[f"{prefix}_layer_{layer_index}_group_b_count"] = layer.group_b.count
+    for prefix in ("nb_tens", "nb_comp"):
+        state[f"{prefix}_layer_1_group_a_diameter_option"] = 12
+        state[f"{prefix}_layer_1_group_a_diameter"] = 12
+        state[f"{prefix}_layer_1_group_a_count"] = 2
+        state[f"{prefix}_layer_1_group_b_diameter_option"] = "-"
+        state[f"{prefix}_layer_1_group_b_diameter"] = 0
+        state[f"{prefix}_layer_1_group_b_count"] = 0
+        for layer_index in (2, 3):
+            state[f"{prefix}_layer_{layer_index}_group_a_diameter_option"] = "-"
+            state[f"{prefix}_layer_{layer_index}_group_a_diameter"] = 0
+            state[f"{prefix}_layer_{layer_index}_group_a_count"] = 0
+            state[f"{prefix}_layer_{layer_index}_group_b_diameter_option"] = "-"
+            state[f"{prefix}_layer_{layer_index}_group_b_diameter"] = 0
+            state[f"{prefix}_layer_{layer_index}_group_b_count"] = 0
     return state
 
 
@@ -188,6 +238,12 @@ def reset_workspace(default_inputs: BeamDesignInputSet) -> None:
     st.session_state.project_date_auto_value = _current_timestamp_text()
     for key, value in build_default_state(default_inputs).items():
         st.session_state[key] = value
+    st.session_state[DEFLECTION_FIRST_ENABLE_KEY] = bool(st.session_state.get("consider_deflection", False))
+    st.session_state[CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] = False
+    st.session_state[NEGATIVE_REBAR_INPUT_BACKUP_KEY] = {}
+    st.session_state[DEFLECTION_IE_METHOD_BACKUP_KEY] = None
+    st.session_state[DEFLECTION_SUPPORT_INPUT_BACKUP_KEY] = {}
+    st.session_state[DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY] = False
     persist_session_state(default_inputs)
 
 
@@ -259,11 +315,12 @@ def render_input_workspace() -> None:
             options=[beam_type.value for beam_type in BeamType],
             horizontal=True,
             key="beam_type",
+            on_change=_handle_beam_type_change,
             help="Simple Beam hides negative-moment design. Continuous Beam shows both positive and negative design workflows.",
         )
         st.caption("Simple Beam = positive-moment workflow only. Continuous Beam = positive and negative moment design.")
         st.checkbox("Include Torsion Design", key="include_torsion_design", on_change=_handle_include_torsion_design_change)
-        st.checkbox("Consider Deflection", key="consider_deflection")
+        st.checkbox("Consider Deflection", key="consider_deflection", on_change=_handle_consider_deflection_change)
 
     with st.expander("3. Material Properties: f'c, fy, fvy", expanded=True):
         cols = st.columns(3, gap="medium")
@@ -331,6 +388,9 @@ def render_input_workspace() -> None:
         _render_shear_spacing_feedback()
         if st.session_state.include_torsion_design:
             _render_torsion_section(preview_results)
+    if st.session_state.consider_deflection:
+        with st.expander(_deflection_section_label(_selected_beam_type()), expanded=True):
+            _render_deflection_section(preview_results)
 
 def _render_shear_inputs() -> None:
     top_cols = st.columns(4 if st.session_state.include_torsion_design else 3, gap="medium")
@@ -516,6 +576,749 @@ def _render_torsion_section(preview_results) -> None:
     for spacing_warning in spacing_warnings:
         if spacing_warning:
             _render_warning_banner(_formalize_constructability_warning_text(spacing_warning))
+
+
+def _render_deflection_section(preview_results) -> None:
+    _ensure_deflection_support_state()
+    st.caption(
+        "Select the serviceability limit that applies to the project. The engineer remains responsible for choosing "
+        "the appropriate limit based on use, finishes, partitions, and project requirements."
+    )
+    support_options = _deflection_support_options_for_member_type(st.session_state.deflection_member_type)
+    top_cols = st.columns([1.0, 1.0], gap="medium")
+    with top_cols[0]:
+        st.markdown("<div class='input-field-label'>Design code</div>", unsafe_allow_html=True)
+        st.caption(f"Uses Project Info code: {st.session_state.design_code}")
+    if len(support_options) > 1:
+        with top_cols[1]:
+            st.selectbox(
+                "Support condition",
+                options=support_options,
+                key="deflection_support_condition",
+            )
+    else:
+        with top_cols[1]:
+            st.markdown("<div class='input-field-label'>Support condition</div>", unsafe_allow_html=True)
+            st.caption(support_options[0])
+    if st.session_state.deflection_support_condition in {
+        DeflectionSupportCondition.CONTINUOUS_2_SPANS.value,
+        DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value,
+    }:
+        ie_method_cols = st.columns([1.0, 0.28], gap="medium")
+        with ie_method_cols[0]:
+            st.selectbox(
+                "Deflection Ie method",
+                options=[method.value for method in DeflectionIeMethod],
+                key="deflection_ie_method",
+                on_change=_handle_deflection_ie_method_change,
+            )
+        with ie_method_cols[1]:
+            _render_info_button(_deflection_ie_method_info_text())
+    else:
+        st.markdown("<div class='input-field-label'>Deflection Ie method</div>", unsafe_allow_html=True)
+        st.caption(DeflectionIeMethod.MIDSPAN_ONLY.value)
+
+    load_cols = st.columns([1.0, 1.0, 1.0, 1.0, 0.28], gap="medium")
+    with load_cols[0]:
+        st.number_input(
+            "DL (kgf/m)",
+            value=float(_automatic_deflection_dead_load_from_state()),
+            step=10.0,
+            disabled=True,
+        )
+    with load_cols[1]:
+        st.number_input(
+            "SDL (kgf/m)",
+            min_value=0.0,
+            step=10.0,
+            key="deflection_additional_sustained_load_kgf_per_m",
+        )
+    with load_cols[2]:
+        st.number_input("Service LL (kgf/m)", min_value=0.0, step=10.0, key="deflection_service_live_load_kgf_per_m")
+    with load_cols[3]:
+        st.number_input(
+            "Sustained LL ratio",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="deflection_sustained_live_load_ratio",
+        )
+    with load_cols[4]:
+        _render_info_button(_deflection_service_load_info_text())
+
+    parameter_cols = st.columns([1.0, 1.0, 0.28, 1.1, 0.28], gap="medium")
+    with parameter_cols[0]:
+        st.number_input("Span length L (m)", min_value=0.01, step=0.1, key="span_length_m")
+    with parameter_cols[1]:
+        if "deflection_long_term_factor_x" not in st.session_state:
+            st.session_state.deflection_long_term_factor_x = 2.0
+        st.number_input(
+            "Long-term factor x",
+            min_value=0.1,
+            step=0.1,
+            key="deflection_long_term_factor_x",
+        )
+    with parameter_cols[2]:
+        _render_info_button(_deflection_long_term_x_info_text())
+    with parameter_cols[3]:
+        st.selectbox(
+            "Allowable Deflection Limit",
+            options=[preset.value for preset in AllowableDeflectionPreset],
+            key="deflection_allowable_limit_preset",
+        )
+    with parameter_cols[4]:
+        _render_info_button(_deflection_limit_info_text())
+
+    limit_detail_cols = st.columns([2.28, 1.0, 1.0], gap="medium")
+    with limit_detail_cols[0]:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+    with limit_detail_cols[1]:
+        if st.session_state.deflection_allowable_limit_preset == AllowableDeflectionPreset.CUSTOM.value:
+            st.number_input(
+                "Custom denominator",
+                min_value=1,
+                step=10,
+                key="deflection_allowable_limit_custom_denominator",
+            )
+        else:
+            st.markdown("<div class='input-field-label'>Selected ratio</div>", unsafe_allow_html=True)
+            st.caption(st.session_state.deflection_allowable_limit_preset)
+    with limit_detail_cols[2]:
+        denominator = (
+            int(st.session_state.deflection_allowable_limit_custom_denominator)
+            if st.session_state.deflection_allowable_limit_preset == AllowableDeflectionPreset.CUSTOM.value
+            else int(st.session_state.deflection_allowable_limit_preset.split("/")[1])
+        )
+        allowable_cm = (float(st.session_state.span_length_m) * 100.0) / denominator
+        st.markdown("<div class='input-field-label'>Allowable deflection</div>", unsafe_allow_html=True)
+        st.caption(f"{format_number(allowable_cm)} cm")
+
+    if st.session_state.deflection_support_condition in {
+        DeflectionSupportCondition.CONTINUOUS_2_SPANS.value,
+        DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value,
+    }:
+        if st.session_state.deflection_ie_method != DeflectionIeMethod.MIDSPAN_ONLY.value:
+            _enter_deflection_support_input_visibility()
+            support_header_cols = st.columns([1.0, 0.28], gap="medium")
+            with support_header_cols[0]:
+                st.selectbox(
+                    "Support moment input",
+                    options=list(DEFLECTION_SUPPORT_MOMENT_MODE_OPTIONS),
+                    key="deflection_support_moment_mode",
+                    on_change=_backup_deflection_support_input_state,
+                )
+            with support_header_cols[1]:
+                _render_info_button(_deflection_support_moment_info_text())
+            support_dead_moment_kgm, support_live_moment_kgm = _resolved_deflection_support_moments_from_state()
+            support_mode = st.session_state.get("deflection_support_moment_mode", "Auto")
+            support_cols = st.columns([1.0, 1.0], gap="medium")
+            with support_cols[0]:
+                if support_mode == "Auto":
+                    st.session_state["deflection_support_dead_load_service_moment_auto_display"] = float(support_dead_moment_kgm)
+                    st.number_input(
+                        "Negative support moment, DL service (kg-m)",
+                        key="deflection_support_dead_load_service_moment_auto_display",
+                        step=10.0,
+                        disabled=True,
+                    )
+                else:
+                    st.number_input(
+                        "Negative support moment, DL service (kg-m)",
+                        max_value=0.0,
+                        step=10.0,
+                        key="deflection_support_dead_load_service_moment_kgm",
+                        on_change=_backup_deflection_support_input_state,
+                    )
+            with support_cols[1]:
+                if support_mode == "Auto":
+                    st.session_state["deflection_support_live_load_service_moment_auto_display"] = float(support_live_moment_kgm)
+                    st.number_input(
+                        "Negative support moment, LL service (kg-m)",
+                        key="deflection_support_live_load_service_moment_auto_display",
+                        step=10.0,
+                        disabled=True,
+                    )
+                else:
+                    st.number_input(
+                        "Negative support moment, LL service (kg-m)",
+                        max_value=0.0,
+                        step=10.0,
+                        key="deflection_support_live_load_service_moment_kgm",
+                        on_change=_backup_deflection_support_input_state,
+                    )
+            if support_mode == "Auto":
+                st.caption(
+                    "Auto mode uses representative negative continuous-support moments from the current span and service loads. "
+                    "Dead-type support moment uses -(DL_auto + SDL); live support moment uses -Service LL."
+                )
+            else:
+                st.caption(
+                    "Manual mode overrides the auto-estimated values. Enter the negative moment value at continuous "
+                    "support for the representative span being checked."
+                )
+        else:
+            _leave_deflection_support_input_visibility()
+            st.caption("Midspan Ie only mode does not use support moments in the deflection calculation.")
+    else:
+        _leave_deflection_support_input_visibility()
+
+    # Recompute directly from the latest session-state values in this section.
+    # Do not fall back to older preview results here because stale serviceability
+    # output is more misleading than showing no preview when current inputs are invalid.
+    try:
+        current_inputs = build_inputs_from_state()
+        preview_results = calculate_full_design_results(current_inputs)
+        st.session_state.preview_design_inputs = current_inputs
+        st.session_state.preview_design_results = preview_results
+    except ValueError:
+        preview_results = None
+    _render_deflection_diagram_fragment(_deflection_reference_diagram_html(preview_results), height=300)
+
+    if preview_results is None:
+        st.caption("Complete the current input set to preview deflection results.")
+        return
+
+    deflection = preview_results.deflection
+    for line in deflection_workspace_summary_lines(deflection):
+        st.markdown(f"<div class='design-banner info'>{line}</div>", unsafe_allow_html=True)
+    if deflection.load_basis_note:
+        st.markdown(f"<div class='design-banner info'>{deflection.load_basis_note}</div>", unsafe_allow_html=True)
+    if deflection.ie_method_selected:
+        method_banner = (
+            f"Selected Ie method = {deflection.ie_method_selected}"
+            if deflection.ie_method_selected == deflection.ie_method_governing or not deflection.ie_method_governing
+            else f"Selected Ie method = {deflection.ie_method_selected} | Governing method = {deflection.ie_method_governing}"
+        )
+        st.markdown(f"<div class='design-banner info'>{method_banner}</div>", unsafe_allow_html=True)
+    if deflection.support_condition in {
+        DeflectionSupportCondition.CONTINUOUS_2_SPANS.value,
+        DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value,
+    }:
+        st.markdown(
+            "<div class='design-banner info'>"
+            f"Support moments for I<sub>e,avg</sub> candidate: M<sub>sup,DL</sub> = {format_number(deflection.support_dead_load_service_moment_kgm)} kg-m, "
+            f"M<sub>sup,LL</sub> = {format_number(deflection.support_live_load_service_moment_kgm)} kg-m."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    for warning in deflection.warnings:
+        if "licensed code text" in warning:
+            _render_warning_banner(f"{warning} This should be confirmed by the design engineer.")
+        elif "load-free" in warning or "live load is zero" in warning:
+            st.markdown(f"<div class='design-banner info'>{warning}</div>", unsafe_allow_html=True)
+        else:
+            _render_warning_banner(warning)
+
+
+
+def _deflection_section_label(beam_type: BeamType) -> str:
+    if beam_type == BeamType.CONTINUOUS:
+        return "8. Deflection Check"
+    return "7. Deflection Check"
+
+
+def _deflection_support_options_for_member_type(member_type_value: str) -> list[str]:
+    member_type = DeflectionMemberType(member_type_value)
+    if member_type == DeflectionMemberType.SIMPLE_BEAM:
+        return [DeflectionSupportCondition.SIMPLE.value]
+    if member_type == DeflectionMemberType.CONTINUOUS_BEAM:
+        return [
+            DeflectionSupportCondition.CONTINUOUS_2_SPANS.value,
+            DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value,
+        ]
+    return [DeflectionSupportCondition.CANTILEVER_PLACEHOLDER.value]
+
+
+def _deflection_member_type_options(beam_type: BeamType) -> list[str]:
+    if beam_type == BeamType.SIMPLE:
+        return [DeflectionMemberType.SIMPLE_BEAM.value]
+    return [DeflectionMemberType.CONTINUOUS_BEAM.value]
+
+
+def _sync_deflection_support_condition() -> None:
+    options = _deflection_support_options_for_member_type(st.session_state.deflection_member_type)
+    if st.session_state.get("deflection_support_condition") not in options:
+        st.session_state.deflection_support_condition = options[0]
+
+
+def _sync_deflection_member_controls() -> None:
+    st.session_state.deflection_member_type = _deflection_member_type_options(_selected_beam_type())[0]
+    _sync_deflection_support_condition()
+
+
+def _handle_beam_type_change() -> None:
+    _handle_deflection_ie_method_for_beam_type_change()
+    _handle_negative_rebar_state_for_beam_type_change()
+    _apply_first_continuous_negative_rebar_defaults()
+    _sync_deflection_member_controls()
+
+
+def _apply_continuous_negative_rebar_defaults() -> None:
+    for prefix in ("nb_tens", "nb_comp"):
+        st.session_state[f"{prefix}_layer_1_group_a_diameter_option"] = 12
+        st.session_state[f"{prefix}_layer_1_group_a_diameter"] = 12
+        st.session_state[f"{prefix}_layer_1_group_a_count"] = 2
+        st.session_state[f"{prefix}_layer_1_group_b_diameter_option"] = "-"
+        st.session_state[f"{prefix}_layer_1_group_b_diameter"] = 0
+        st.session_state[f"{prefix}_layer_1_group_b_count"] = 0
+        for layer_index in (2, 3):
+            st.session_state[f"{prefix}_layer_{layer_index}_group_a_diameter_option"] = "-"
+            st.session_state[f"{prefix}_layer_{layer_index}_group_a_diameter"] = 0
+            st.session_state[f"{prefix}_layer_{layer_index}_group_a_count"] = 0
+            st.session_state[f"{prefix}_layer_{layer_index}_group_b_diameter_option"] = "-"
+            st.session_state[f"{prefix}_layer_{layer_index}_group_b_diameter"] = 0
+            st.session_state[f"{prefix}_layer_{layer_index}_group_b_count"] = 0
+
+
+def _apply_first_continuous_negative_rebar_defaults() -> None:
+    if _selected_beam_type() != BeamType.CONTINUOUS:
+        return
+    if _restore_negative_rebar_input_backup():
+        st.session_state[CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] = True
+        return
+    if st.session_state.get(CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY, False):
+        return
+    _apply_continuous_negative_rebar_defaults()
+    st.session_state[CONTINUOUS_NEGATIVE_DEFAULTS_APPLIED_KEY] = True
+
+
+def _negative_rebar_input_state_keys() -> tuple[str, ...]:
+    keys: list[str] = []
+    for prefix in ("nb_tens", "nb_comp"):
+        for layer_index in range(1, 4):
+            keys.extend(
+                [
+                    f"{prefix}_layer_{layer_index}_group_a_diameter_option",
+                    f"{prefix}_layer_{layer_index}_group_a_diameter",
+                    f"{prefix}_layer_{layer_index}_group_a_count",
+                    f"{prefix}_layer_{layer_index}_group_b_diameter_option",
+                    f"{prefix}_layer_{layer_index}_group_b_diameter",
+                    f"{prefix}_layer_{layer_index}_group_b_count",
+                ]
+            )
+    keys.append("negative_mu_kgm")
+    return tuple(keys)
+
+
+def _handle_negative_rebar_state_for_beam_type_change() -> None:
+    if _selected_beam_type() == BeamType.CONTINUOUS:
+        return
+    st.session_state[NEGATIVE_REBAR_INPUT_BACKUP_KEY] = {
+        key: st.session_state[key]
+        for key in _negative_rebar_input_state_keys()
+        if key in st.session_state
+    }
+
+
+def _restore_negative_rebar_input_backup() -> bool:
+    backup_state = st.session_state.get(NEGATIVE_REBAR_INPUT_BACKUP_KEY)
+    if not isinstance(backup_state, dict) or not backup_state:
+        return False
+    for key, value in backup_state.items():
+        st.session_state[key] = value
+    return True
+
+
+def _backup_deflection_ie_method_for_continuous() -> None:
+    method_value = st.session_state.get("deflection_ie_method")
+    if method_value in {method.value for method in DeflectionIeMethod}:
+        st.session_state[DEFLECTION_IE_METHOD_BACKUP_KEY] = method_value
+
+
+def _restore_deflection_ie_method_for_continuous() -> bool:
+    method_value = st.session_state.get(DEFLECTION_IE_METHOD_BACKUP_KEY)
+    if method_value not in {method.value for method in DeflectionIeMethod}:
+        return False
+    st.session_state["deflection_ie_method"] = method_value
+    return True
+
+
+def _handle_deflection_ie_method_for_beam_type_change() -> None:
+    if _selected_beam_type() == BeamType.CONTINUOUS:
+        _restore_deflection_ie_method_for_continuous()
+        return
+    _backup_deflection_ie_method_for_continuous()
+
+
+def _deflection_support_input_state_keys() -> tuple[str, ...]:
+    return (
+        "deflection_support_moment_mode",
+        "deflection_support_dead_load_service_moment_kgm",
+        "deflection_support_live_load_service_moment_kgm",
+    )
+
+
+def _backup_deflection_support_input_state() -> None:
+    st.session_state[DEFLECTION_SUPPORT_INPUT_BACKUP_KEY] = {
+        key: st.session_state[key]
+        for key in _deflection_support_input_state_keys()
+        if key in st.session_state
+    }
+
+
+def _restore_deflection_support_input_backup() -> bool:
+    backup_state = st.session_state.get(DEFLECTION_SUPPORT_INPUT_BACKUP_KEY)
+    if not isinstance(backup_state, dict) or not backup_state:
+        return False
+    for key, value in backup_state.items():
+        st.session_state[key] = value
+    return True
+
+
+def _handle_deflection_ie_method_change() -> None:
+    if st.session_state.get("deflection_ie_method") == DeflectionIeMethod.MIDSPAN_ONLY.value:
+        _backup_deflection_support_input_state()
+
+
+def _enter_deflection_support_input_visibility() -> None:
+    if st.session_state.get(DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY, False):
+        return
+    _restore_deflection_support_input_backup()
+    st.session_state[DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY] = True
+
+
+def _leave_deflection_support_input_visibility() -> None:
+    if not st.session_state.get(DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY, False):
+        return
+    _backup_deflection_support_input_state()
+    st.session_state[DEFLECTION_SUPPORT_INPUT_VISIBLE_KEY] = False
+
+
+def _apply_first_enable_deflection_defaults(default_state: dict[str, object]) -> None:
+    for key in (
+        "deflection_sustained_live_load_ratio",
+        "span_length_m",
+        "deflection_long_term_factor_x",
+        "deflection_allowable_limit_preset",
+        "deflection_ie_method",
+    ):
+        st.session_state[key] = default_state[key]
+
+
+def _handle_consider_deflection_change() -> None:
+    if not bool(st.session_state.get("consider_deflection", False)):
+        return
+    if st.session_state.get(DEFLECTION_FIRST_ENABLE_KEY, False):
+        return
+    _apply_first_enable_deflection_defaults(build_default_state(load_default_inputs()))
+    _sync_deflection_member_controls()
+    st.session_state[DEFLECTION_FIRST_ENABLE_KEY] = True
+
+
+def _ensure_deflection_support_state() -> None:
+    if "deflection_member_type" not in st.session_state:
+        return
+    _sync_deflection_member_controls()
+
+
+def _deflection_reference_diagram_html(preview_results=None, *, summary_mode: bool = False, palette=None) -> str:
+    palette = palette or LIGHT_THEME
+    support_color = "#111111"
+    calculated_curve_color = "#0b5cab"
+    support_condition = st.session_state.deflection_support_condition
+    width = 520.0
+    height = 172.0
+    beam_y = 68.0
+    left_x = 44.0
+    right_x = 476.0
+    span_width = right_x - left_x
+    support_positions: list[float]
+    highlight_positions: list[float]
+    span_amplitudes: list[float]
+    title = "Deflection Reference Diagram"
+    note = "Highlighted point shows the deflection check location used by this module."
+    calculated_deflection_cm = 0.0
+    allowable_deflection_cm = 0.0
+    vertical_scale_note = "Reference plot only."
+    if preview_results is not None:
+        calculated_deflection_cm = float(preview_results.deflection.total_service_deflection_cm)
+        allowable_deflection_cm = float(preview_results.deflection.allowable_deflection_cm)
+    base_amplitude = 18.0
+    limit_amplitude = 30.0
+    if allowable_deflection_cm > 0:
+        governing_deflection_cm = max(calculated_deflection_cm, allowable_deflection_cm, 1e-9)
+        # Auto-scale the vertical plot so small service deflections still read clearly on screen.
+        base_amplitude = 12.0 + (24.0 * (calculated_deflection_cm / governing_deflection_cm))
+        limit_amplitude = 12.0 + (24.0 * (allowable_deflection_cm / governing_deflection_cm))
+        vertical_scale_note = (
+            f"Vertical deflected shape is exaggerated for visibility. Total service deflection = "
+            f"{format_number(calculated_deflection_cm)} cm, allowable = {format_number(allowable_deflection_cm)} cm."
+        )
+
+    if support_condition == DeflectionSupportCondition.SIMPLE.value:
+        support_positions = [left_x, right_x]
+        highlight_positions = [left_x + (span_width / 2.0)]
+        span_amplitudes = [base_amplitude]
+        note = "Simple beam: maximum deflection is checked at midspan."
+    elif support_condition == DeflectionSupportCondition.CONTINUOUS_2_SPANS.value:
+        support_positions = [left_x, left_x + (span_width / 2.0), right_x]
+        highlight_positions = [left_x + (span_width * 0.25), left_x + (span_width * 0.75)]
+        span_amplitudes = [base_amplitude * 0.88, base_amplitude * 0.88]
+        note = "Continuous 2 spans: the module checks both Ie at midspan and representative Ie,avg, then uses the larger deflection."
+    elif support_condition == DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value:
+        support_positions = [left_x, left_x + (span_width / 3.0), left_x + (2.0 * span_width / 3.0), right_x]
+        highlight_positions = [left_x + (span_width / 2.0)]
+        span_amplitudes = [base_amplitude * 0.72, base_amplitude, base_amplitude * 0.72]
+        note = "Continuous 3 or more spans: the module checks both Ie at the interior representative span midspan and representative Ie,avg, then uses the larger deflection."
+    else:
+        support_positions = [left_x, right_x]
+        highlight_positions = [left_x + (span_width / 2.0)]
+        span_amplitudes = [base_amplitude]
+        note = "Mockup only / reserved for future cantilever module expansion."
+
+    support_markup: list[str] = []
+    for support_x in support_positions:
+        support_markup.append(
+            f"<polygon class='deflection-support-triangle' "
+            f"points='{support_x - 12:.2f},{beam_y + 26:.2f} {support_x + 12:.2f},{beam_y + 26:.2f} {support_x:.2f},{beam_y - 0.6:.2f}' "
+            f"fill='{support_color}' stroke='{support_color}' stroke-width='2.0' "
+            f"style='fill:{support_color};stroke:{support_color};stroke-width:2.0' />"
+        )
+    highlight_markup = []
+    # The dashed deflected shape is drawn as a quadratic Bezier for each span.
+    # At the span midpoint (t = 0.5), the curve ordinate is beam_y + amplitude / 2.
+    highlight_y_positions: list[float] = []
+    if support_condition == DeflectionSupportCondition.SIMPLE.value:
+        highlight_y_positions = [beam_y + (span_amplitudes[0] / 2.0)]
+    elif support_condition == DeflectionSupportCondition.CONTINUOUS_2_SPANS.value:
+        highlight_y_positions = [beam_y + (span_amplitudes[0] / 2.0), beam_y + (span_amplitudes[1] / 2.0)]
+    elif support_condition == DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value:
+        highlight_y_positions = [beam_y + (span_amplitudes[1] / 2.0)]
+    else:
+        highlight_y_positions = [beam_y + (span_amplitudes[0] / 2.0)]
+    for highlight_x, highlight_y in zip(highlight_positions, highlight_y_positions):
+        delta_label = f"&#916;max = {format_number(calculated_deflection_cm)} cm" if calculated_deflection_cm > 0 else "&#916;max"
+        label_y = highlight_y + 20.0
+        label_x = highlight_x - 34.0
+        highlight_markup.append(
+            f"<line class='deflection-highlight-guide' x1='{highlight_x:.2f}' y1='{beam_y - 22:.2f}' x2='{highlight_x:.2f}' y2='{highlight_y - 8:.2f}' "
+            f"stroke='{palette.fail}' stroke-width='1.4' stroke-dasharray='4 3' "
+            f"style='stroke:{palette.fail};stroke-width:1.4;stroke-dasharray:4 3' />"
+            f"<circle class='deflection-highlight-ring' cx='{highlight_x:.2f}' cy='{highlight_y:.2f}' r='7' fill='none' stroke='{palette.fail}' stroke-width='2.2' "
+            f"style='fill:none;stroke:{palette.fail};stroke-width:2.2' />"
+            f"<circle class='deflection-highlight-dot' cx='{highlight_x:.2f}' cy='{highlight_y:.2f}' r='3.2' fill='{palette.fail}' style='fill:{palette.fail}' />"
+            f"<rect x='{label_x - 3:.2f}' y='{label_y - 11.5:.2f}' width='82' height='16' rx='6' fill='{palette.surface}' fill-opacity='0.92' />"
+            f"<text x='{label_x:.2f}' y='{label_y:.2f}' font-size='10.5' font-weight='700' fill='{palette.fail}'>{delta_label}</text>"
+        )
+    span_labels = []
+    for index in range(len(support_positions) - 1):
+        start_x = support_positions[index]
+        end_x = support_positions[index + 1]
+        span_labels.append(
+            f"<text x='{(start_x + end_x) / 2.0:.2f}' y='{beam_y - 16:.2f}' text-anchor='middle' font-size='10.5' fill='{palette.muted_text}'>Span {index + 1}</text>"
+        )
+    deflected_shape_segments = [f"M {support_positions[0]:.2f} {beam_y:.2f}"]
+    for index, amplitude in enumerate(span_amplitudes):
+        start_x = support_positions[index]
+        end_x = support_positions[index + 1]
+        mid_x = (start_x + end_x) / 2.0
+        deflected_shape_segments.append(f"Q {mid_x:.2f} {beam_y + amplitude:.2f}, {end_x:.2f} {beam_y:.2f}")
+    deflected_shape_path = " ".join(deflected_shape_segments)
+    limit_shape_segments = [f"M {support_positions[0]:.2f} {beam_y:.2f}"]
+    for index, amplitude in enumerate(span_amplitudes):
+        start_x = support_positions[index]
+        end_x = support_positions[index + 1]
+        mid_x = (start_x + end_x) / 2.0
+        if support_condition == DeflectionSupportCondition.CONTINUOUS_2_SPANS.value:
+            reference_amplitude = limit_amplitude * 0.88
+        elif support_condition == DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS.value:
+            reference_amplitude = [limit_amplitude * 0.72, limit_amplitude, limit_amplitude * 0.72][index]
+        else:
+            reference_amplitude = limit_amplitude
+        limit_shape_segments.append(f"Q {mid_x:.2f} {beam_y + reference_amplitude:.2f}, {end_x:.2f} {beam_y:.2f}")
+    limit_shape_path = " ".join(limit_shape_segments)
+    legend_html = ""
+    deflected_stroke_opacity = "1.0" if summary_mode else "0.82"
+    limit_path_html = ""
+    max_point_note_html = ""
+    note_text = note
+    if summary_mode:
+        legend_html = (
+            "<div class='metric-note' style='display:flex;gap:1rem;justify-content:center;align-items:center;margin-top:0.35rem'>"
+            f"<span style='display:inline-flex;align-items:center;gap:0.35rem'><span style='width:18px;height:0;border-top:2px dashed {calculated_curve_color};display:inline-block'></span>Calculated deflection shape</span>"
+            f"<span style='display:inline-flex;align-items:center;gap:0.35rem'><span style='width:18px;height:0;border-top:2px dashed {palette.fail};display:inline-block'></span>Allowable limit shape</span>"
+            "</div>"
+        )
+        limit_path_html = (
+            f"<path d=\"{limit_shape_path}\" fill=\"none\" stroke=\"{palette.fail}\" "
+            f"stroke-width=\"2.2\" stroke-opacity=\"0.72\" stroke-dasharray=\"5 4\" />"
+        )
+        note_text = "Reference comparison between calculated deflection shape and allowable limit shape."
+    else:
+        max_point_note_html = (
+            f"<text x=\"{width / 2.0:.2f}\" y=\"{height - 20:.2f}\" text-anchor=\"middle\" "
+            f"font-size=\"11\" font-weight=\"600\" fill=\"{palette.fail}\">Max deflection check point</text>"
+        )
+    highlight_markup_content = "".join(highlight_markup) if not summary_mode else ""
+
+    return dedent(f"""
+    <div style="margin-top:0.85rem;padding:0.95rem 1rem 0.8rem 1rem;border-radius:16px;border:1px solid {palette.border};background:linear-gradient(160deg,{palette.surface},{palette.surface_alt});box-sizing:border-box;">
+      <div style="color:{palette.text};font-size:1rem;font-weight:700;margin-bottom:0.5rem;">{title}</div>
+      <svg width="100%" viewBox="0 0 {width:.0f} {height:.0f}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Deflection reference diagram" preserveAspectRatio="xMidYMid meet" style="width:100%;max-width:{width:.0f}px;height:auto;display:block;margin:0 auto;overflow:visible">
+        <rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" rx="14" fill="{palette.surface_alt}" />
+        <line x1="{left_x:.2f}" y1="{beam_y:.2f}" x2="{right_x:.2f}" y2="{beam_y:.2f}" stroke="{palette.text}" stroke-width="4.2" stroke-linecap="round" style="stroke:{palette.text};stroke-width:4.2" />
+        <path d="{deflected_shape_path}" fill="none" stroke="{calculated_curve_color}" stroke-width="2.8" stroke-opacity="{deflected_stroke_opacity}" stroke-dasharray="7 5" style="fill:none;stroke:{calculated_curve_color};stroke-width:2.8;stroke-opacity:{deflected_stroke_opacity};stroke-dasharray:7 5" />
+        {limit_path_html}
+        {''.join(support_markup)}
+        {''.join(span_labels)}
+        {highlight_markup_content}
+        {max_point_note_html}
+      </svg>
+      {legend_html}
+      <div style="color:{palette.text};opacity:0.94;font-size:0.82rem;line-height:1.38;margin-top:0.45rem;">{note_text} {vertical_scale_note}</div>
+    </div>
+    """).strip()
+
+
+def _selected_deflection_code_for_info() -> DeflectionCodeVersion:
+    return _deflection_design_code_from_main_code(DesignCode(st.session_state.design_code))
+
+
+def _deflection_code_heading_for_info() -> str:
+    mapping = {
+        DeflectionCodeVersion.ACI318_99: "ACI318-99 - Clause 9.5",
+        DeflectionCodeVersion.ACI318_11: "ACI318-11 - Clause 9.5",
+        DeflectionCodeVersion.ACI318_14: "ACI318-14 - Chapter 24",
+        DeflectionCodeVersion.ACI318_19: "ACI318-19 - Chapter 24",
+    }
+    return mapping[_selected_deflection_code_for_info()]
+
+
+def _render_html_fragment(html: str, *, height: int) -> None:
+    del height
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_deflection_diagram_fragment(html: str, *, height: int) -> None:
+    components.html(html, height=height, scrolling=False)
+
+
+def _render_overall_deflection_diagram(results) -> None:
+    _render_html_fragment(
+        _deflection_reference_diagram_html(results, summary_mode=True, palette=LIGHT_THEME),
+        height=300,
+    )
+
+
+def _deflection_long_term_clause_for_info() -> str:
+    mapping = {
+        DeflectionCodeVersion.ACI318_99: "ACI318-99 - Clause 9.5.2.5",
+        DeflectionCodeVersion.ACI318_11: "ACI318-11 - Clause 9.5.2.5",
+        DeflectionCodeVersion.ACI318_14: "ACI318-14 - Chapter 24.2.4",
+        DeflectionCodeVersion.ACI318_19: "ACI318-19 - Chapter 24.2.4",
+    }
+    return mapping[_selected_deflection_code_for_info()]
+
+
+def _deflection_immediate_clause_for_info() -> str:
+    mapping = {
+        DeflectionCodeVersion.ACI318_99: "ACI318-99 - Clause 9.5.2 and Clause 9.5.2.3",
+        DeflectionCodeVersion.ACI318_11: "ACI318-11 - Clause 9.5.2 and Clause 9.5.2.3",
+        DeflectionCodeVersion.ACI318_14: "ACI318-14 - Chapter 24.2.3",
+        DeflectionCodeVersion.ACI318_19: "ACI318-19 - Chapter 24.2.3",
+    }
+    return mapping[_selected_deflection_code_for_info()]
+
+
+def _deflection_limit_info_text() -> str:
+    return (
+        f"Code reference\n{_deflection_code_heading_for_info()}\n\n"
+        "Code-based note:\n"
+        f"- {_deflection_code_heading_for_info()} gives the serviceability framework for deflection checks in the selected code version.\n"
+        "- In this module, the allowable limit ratio is selected by the engineer; the app does not auto-assign a project limit from the code text.\n\n"
+        "Allowable Deflection Limit is selected by the engineer for the project serviceability requirement.\n\n"
+        "Available limits in this app:\n"
+        "- L/120\n"
+        "- L/180\n"
+        "- L/240 (default)\n"
+        "- L/360\n"
+        "- L/480\n"
+        "- L/600\n"
+        "- Custom\n\n"
+        "Typical engineering use of common limits:\n"
+        "- The use cases below are engineering guidance in this app and are not directly assigned to these exact ratios by the selected ACI code text.\n"
+        "- L/120: very lenient limit; temporary work or noncritical visual serviceability cases.\n"
+        "- L/180: light serviceability control where visible deflection is acceptable.\n"
+        "- L/240: common general building limit where moderate deflection control is needed.\n"
+        "- L/360: typical limit where finishes, partitions, or user comfort require tighter control.\n"
+        "- L/480: tighter architectural/serviceability control for more sensitive finishes.\n"
+        "- L/600: very strict serviceability target for highly sensitive finishes or appearance requirements.\n"
+        "- Custom: use the project-specific requirement when specified by the design criteria.\n\n"
+        "Meaning of L in this module:\n"
+        "- Simple beam: L = serviceability span length of the simple span being checked.\n"
+        "- Continuous, 2 spans: L = serviceability span length of the representative span being checked.\n"
+        "- Continuous, 3 or more spans: L = serviceability span length of the representative interior span being checked.\n"
+        "- Cantilever placeholder: reserved for future module expansion.\n\n"
+        "The app does not assume which project limit governs. The engineer should choose the limit appropriate "
+        "for occupancy, finishes, partitions, code interpretation, and project requirements."
+    )
+
+
+def _deflection_service_load_info_text() -> str:
+    return (
+        f"Code reference\n{_deflection_immediate_clause_for_info()} together with {_deflection_long_term_clause_for_info()}\n\n"
+        "Span length L is the serviceability span used in the deflection calculation. Default at startup = 1.0 m.\n\n"
+        "DL is calculated automatically from the beam self-weight in this app:\n"
+        "DL_auto = b_w x h x gamma_c\n"
+        f"with b_w and h in m, and gamma_c = {NORMAL_WEIGHT_CONCRETE_UNIT_WEIGHT_KGF_PER_M3:.0f} kgf/m^3.\n\n"
+        "Service LL is the unfactored service live load used for deflection.\n\n"
+        "SDL means Additional sustained dead load. It is extra sustained dead load not already included in the beam "
+        "self-weight, such as superimposed dead load, permanent equipment, or other long-duration dead load.\n\n"
+        "Long-term sustained load used by this module:\n"
+        "w_sustained = DL_auto + SDL + (Sustained LL ratio x Service LL)\n\n"
+        f"Code reference\n{_deflection_long_term_clause_for_info()}\n\n"
+        "Sustained LL ratio is the portion of service live load treated as sustained for the long-term deflection check.\n\n"
+        "Input range in this app = 0.00 to 1.00. Startup default in this app = 0.30.\n\n"
+        "This is not the same as SDL. SDL is entered directly as kgf/m, while Sustained LL ratio is only the sustained "
+        "fraction of Service LL.\n\n"
+        "Use a larger value when a greater portion of live load is expected to remain for long duration. Use a smaller "
+        "value when most live load is transient.\n\n"
+        "The automatic beam self-weight model above is an app load assumption for serviceability input. It is not a "
+        "directly prescribed load-calculation clause in ACI.\n\n"
+        "This automatic DL is used only in Deflection Check. Strength design for Mu and Vu remains based on the "
+        "user-entered factored actions."
+    )
+
+
+def _deflection_long_term_x_info_text() -> str:
+    return (
+        f"Code reference\n{_deflection_long_term_clause_for_info()}\n\n"
+        "Long-term factor x is the time-dependent multiplier used by this app in the additional long-term deflection check.\n\n"
+        "Recommended starting values in this workflow:\n"
+        "- x = 1.0 for little or no additional long-term amplification\n"
+        "- x = 1.4 for moderate sustained loading\n"
+        "- x = 2.0 for long-duration sustained loading and conservative design review\n\n"
+        "Startup default in this app = 2.0.\n\n"
+        "The selected ACI code defines the long-term deflection check framework under the reference above. The engineer "
+        "should choose x to match the intended sustained loading duration and service condition."
+    )
+
+
+def _deflection_support_moment_info_text() -> str:
+    return (
+        f"Code reference\n{_deflection_immediate_clause_for_info()}\n\n"
+        "Support service moments are used in the continuous-span Ie,avg candidate in this module.\n\n"
+        "Auto mode estimates representative negative support moments for the current workflow.\n"
+        "- Continuous, 2 spans: Msup = -wL^2/8\n"
+        "- Continuous, 3 or more spans: Msup = -wL^2/12\n\n"
+        "In Auto mode, the dead-type support moment uses w = DL_auto + SDL and the live-load support moment uses "
+        "w = Service LL, both shown as negative hogging moments.\n\n"
+        "Manual mode allows direct entry of negative support moments from the service-load analysis model used for the "
+        "continuous beam.\n\n"
+        "For continuous spans, this module checks both Ie at midspan and representative Ie,avg, then uses the larger "
+        "deflection result."
+    )
+
+
+def _deflection_ie_method_info_text() -> str:
+    return (
+        f"Code reference\n{_deflection_immediate_clause_for_info()}\n\n"
+        "This selector controls how effective moment of inertia is used in the continuous-beam deflection check.\n\n"
+        "- Midspan Ie only: use Ie from the midspan section only.\n"
+        "- Averaged Ie (midspan + support): calculate Ie at midspan and support, then use the arithmetic average.\n"
+        "- Conservative / Worst Case: calculate both methods and use the larger deflection for design.\n\n"
+        "For conservative design, the larger deflection from the two Ie evaluation methods is used."
+    )
 
 
 def render_reinforcement_editor(prefix: str, label: str, preview_inputs=None, preview_results=None, *, show_phi: bool = False) -> None:
@@ -858,6 +1661,8 @@ def _render_shear_spacing_feedback() -> None:
 def render_summary_panel(inputs: BeamDesignInputSet, results, palette) -> None:
     st.markdown("<div class='panel-card'>", unsafe_allow_html=True)
     summary_section_number = 8 if inputs.has_negative_design else 7
+    if inputs.consider_deflection:
+        summary_section_number += 1
     st.markdown(
         f"<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;'>"
         f"<div><div class='hero-title' style='font-size:1.25rem;'>{summary_section_number}. Overall Summary</div>"
@@ -995,6 +1800,29 @@ def render_key_metrics(inputs: BeamDesignInputSet, results, palette) -> None:
                 ("Status", results.torsion.status, _torsion_warning_summary(results.torsion)),
             ]
             _render_metric_group("Torsion", torsion_metrics, palette)
+    if inputs.consider_deflection:
+        deflection_metrics = [
+            ("Ie method", results.deflection.ie_method_governing or results.deflection.ie_method_selected, results.deflection.ie_method_selected),
+            ("Allowable deflection", format_number(results.deflection.allowable_deflection_cm), "cm"),
+            ("Calculated deflection", format_number(results.deflection.calculated_deflection_cm), "cm"),
+            (
+                "Capacity Ratio (Deflection)",
+                capacity_ratio_html(results.deflection.capacity_ratio),
+                "Calculated / Allowable",
+            ),
+            ("Immediate total", format_number(results.deflection.immediate_total_deflection_cm), "cm"),
+            ("Long-term additional", format_number(results.deflection.additional_long_term_deflection_cm), "cm"),
+            ("Pass / Fail", results.deflection.status, results.deflection.pass_fail_summary or results.deflection.note),
+        ]
+        if results.deflection.method_2_total_service_deflection_cm is not None:
+            deflection_metrics.insert(3, ("Method 1", format_number(results.deflection.method_1_total_service_deflection_cm), "cm"))
+            deflection_metrics.insert(4, ("Method 2", format_number(results.deflection.method_2_total_service_deflection_cm), "cm"))
+        _render_metric_group(
+            "Deflection",
+            deflection_metrics,
+            palette,
+        )
+        _render_overall_deflection_diagram(results)
     overall_label = results.overall_status
     if overall_label == "DOES NOT MEET REQUIREMENTS":
         overall_label = "DOES NOT MEET DESIGN REQUIREMENTS"
@@ -1022,7 +1850,10 @@ def _render_metric_group(title: str, metrics: list[tuple[str, object, str]], pal
                 unsafe_allow_html=True,
             )
     if extra_html:
-        st.markdown(extra_html, unsafe_allow_html=True)
+        if "deflection-reference-diagram-card" in extra_html:
+            _render_html_fragment(extra_html, height=300)
+        else:
+            st.markdown(extra_html, unsafe_allow_html=True)
 
 
 def _build_shear_torsion_interaction_diagram_html(combined, palette, torsion_results=None) -> str:
@@ -1183,6 +2014,9 @@ def build_inputs_from_state() -> BeamDesignInputSet:
     main_steel_yield_ksc = _resolved_grade_value("fy_grade_option", "fy_ksc")
     shear_steel_yield_ksc = _resolved_grade_value("fvy_grade_option", "fvy_ksc")
     torsion_longitudinal_fy_ksc = _resolved_grade_value("torsion_longitudinal_fy_grade_option", "torsion_longitudinal_fy_ksc")
+    automatic_deflection_dead_load_kgf_per_m = _automatic_deflection_dead_load_from_state()
+    resolved_support_dead_moment_kgm, resolved_support_live_moment_kgm = _resolved_deflection_support_moments_from_state()
+    resolved_deflection_ie_method = _resolved_deflection_ie_method_from_state()
     return BeamDesignInputSet(
         beam_type=BeamType(st.session_state.beam_type),
         consider_deflection=bool(st.session_state.consider_deflection),
@@ -1254,14 +2088,24 @@ def build_inputs_from_state() -> BeamDesignInputSet:
             tension_reinforcement=_build_arrangement_from_state("nb_tens"),
         ),
         deflection=DeflectionCheckInput(
+            design_code=_deflection_design_code_from_main_code(DesignCode(st.session_state.design_code)),
+            member_type=DeflectionMemberType(st.session_state.deflection_member_type),
+            support_condition=DeflectionSupportCondition(st.session_state.deflection_support_condition),
+            ie_method=resolved_deflection_ie_method,
+            allowable_limit_preset=AllowableDeflectionPreset(st.session_state.deflection_allowable_limit_preset),
+            allowable_limit_custom_denominator=int(st.session_state.deflection_allowable_limit_custom_denominator),
+            long_term_factor_x=float(st.session_state.deflection_long_term_factor_x),
             beam_type=DeflectionBeamType(st.session_state.deflection_beam_type),
             beam_type_factor_x=float(st.session_state.beam_type_factor_x),
             span_length_m=float(st.session_state.span_length_m),
-            sustained_live_load_ratio=float(st.session_state.sustained_live_load_ratio),
+            service_dead_load_kgf_per_m=automatic_deflection_dead_load_kgf_per_m,
+            service_live_load_kgf_per_m=float(st.session_state.deflection_service_live_load_kgf_per_m),
+            additional_sustained_load_kgf_per_m=float(st.session_state.deflection_additional_sustained_load_kgf_per_m),
+            sustained_live_load_ratio=float(st.session_state.deflection_sustained_live_load_ratio),
+            support_dead_load_service_moment_kgm=resolved_support_dead_moment_kgm,
+            support_live_load_service_moment_kgm=resolved_support_live_moment_kgm,
             midspan_dead_load_service_moment_kgm=float(st.session_state.midspan_dead_load_service_moment_kgm),
             midspan_live_load_service_moment_kgm=float(st.session_state.midspan_live_load_service_moment_kgm),
-            support_dead_load_service_moment_kgm=float(st.session_state.support_dead_load_service_moment_kgm),
-            support_live_load_service_moment_kgm=float(st.session_state.support_live_load_service_moment_kgm),
             immediate_deflection_limit_description=str(st.session_state.immediate_deflection_limit_description),
             total_deflection_limit_description=str(st.session_state.total_deflection_limit_description),
         ),
@@ -1328,6 +2172,10 @@ def _torsion_design_code_from_main_code(design_code: DesignCode) -> TorsionDesig
     return TorsionDesignCode[design_code.name]
 
 
+def _deflection_design_code_from_main_code(design_code: DesignCode) -> DeflectionCodeVersion:
+    return DeflectionCodeVersion[f"{design_code.name}"]
+
+
 def _torsion_longitudinal_area_from_state() -> float:
     diameter_mm = _resolved_diameter_value(
         "torsion_longitudinal_diameter_option",
@@ -1340,8 +2188,82 @@ def _torsion_longitudinal_area_from_state() -> float:
     return _bar_area_cm2(diameter_mm) * count
 
 
+def _automatic_deflection_dead_load_kgf_per_m_from_dimensions(width_cm: float, depth_cm: float) -> float:
+    width_m = width_cm / 100.0
+    depth_m = depth_cm / 100.0
+    return width_m * depth_m * NORMAL_WEIGHT_CONCRETE_UNIT_WEIGHT_KGF_PER_M3
+
+
+def _automatic_deflection_dead_load_from_state() -> float:
+    return _automatic_deflection_dead_load_kgf_per_m_from_dimensions(
+        float(st.session_state.width_cm),
+        float(st.session_state.depth_cm),
+    )
+
+
+def _deflection_support_moment_coefficient(support_condition: DeflectionSupportCondition) -> float:
+    return {
+        DeflectionSupportCondition.CONTINUOUS_2_SPANS: 1.0 / 8.0,
+        DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS: 1.0 / 12.0,
+    }.get(support_condition, 0.0)
+
+
+def _auto_deflection_support_moments_from_state() -> tuple[float, float]:
+    support_condition = DeflectionSupportCondition(st.session_state.deflection_support_condition)
+    coefficient = _deflection_support_moment_coefficient(support_condition)
+    if coefficient <= 0.0:
+        return 0.0, 0.0
+    span_length_m = float(st.session_state.span_length_m)
+    dead_like_load_kgf_per_m = (
+        _automatic_deflection_dead_load_from_state()
+        + float(st.session_state.get("deflection_additional_sustained_load_kgf_per_m", 0.0))
+    )
+    live_load_kgf_per_m = float(st.session_state.get("deflection_service_live_load_kgf_per_m", 0.0))
+    return (
+        -(coefficient * dead_like_load_kgf_per_m * (span_length_m**2)),
+        -(coefficient * live_load_kgf_per_m * (span_length_m**2)),
+    )
+
+
+def _resolved_deflection_support_moments_from_state() -> tuple[float, float]:
+    support_condition = DeflectionSupportCondition(st.session_state.deflection_support_condition)
+    if support_condition not in {
+        DeflectionSupportCondition.CONTINUOUS_2_SPANS,
+        DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS,
+    }:
+        return 0.0, 0.0
+    if st.session_state.get("deflection_support_moment_mode", "Auto") == "Auto":
+        return _auto_deflection_support_moments_from_state()
+    return (
+        float(st.session_state.get("deflection_support_dead_load_service_moment_kgm", 0.0)),
+        float(st.session_state.get("deflection_support_live_load_service_moment_kgm", 0.0)),
+    )
+
+
+def _resolved_deflection_ie_method_from_state() -> DeflectionIeMethod:
+    support_condition = DeflectionSupportCondition(st.session_state.deflection_support_condition)
+    if support_condition not in {
+        DeflectionSupportCondition.CONTINUOUS_2_SPANS,
+        DeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS,
+    }:
+        return DeflectionIeMethod.MIDSPAN_ONLY
+    return DeflectionIeMethod(st.session_state.get("deflection_ie_method", DeflectionIeMethod.WORST_CASE.value))
+
+
 def _workspace_state_keys(default_inputs: BeamDesignInputSet) -> set[str]:
     return {"project_date_auto_value", *build_default_state(default_inputs).keys()}
+
+
+def _deflection_state_keys(default_state: dict[str, object]) -> tuple[str, ...]:
+    return tuple(key for key in default_state if key.startswith("deflection_") or key in {"span_length_m"})
+
+
+def _initialize_deflection_defaults_once(default_state: dict[str, object]) -> None:
+    if st.session_state.get(DEFLECTION_DEFAULTS_VERSION_KEY) == DEFLECTION_DEFAULTS_VERSION:
+        return
+    for key in _deflection_state_keys(default_state):
+        st.session_state[key] = default_state[key]
+    st.session_state[DEFLECTION_DEFAULTS_VERSION_KEY] = DEFLECTION_DEFAULTS_VERSION
 
 
 def _sync_layer_group_counts_from_selected_diameters(prefix: str, layer_index: int) -> None:
@@ -1632,4 +2554,14 @@ def _render_torsion_demand_type_info() -> None:
         return
     with st.expander("Info"):
         st.markdown(TORSION_DEMAND_TYPE_INFO_TEXT)
+
+
+def _render_info_button(text: str, *, label: str = "i") -> None:
+    popover = getattr(st, "popover", None)
+    if callable(popover):
+        with popover(label):
+            st.markdown(text)
+        return
+    with st.expander(label):
+        st.markdown(text)
 

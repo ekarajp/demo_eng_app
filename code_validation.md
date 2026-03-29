@@ -8,8 +8,7 @@ This repository now treats the beam strength workflow in two separate buckets:
   - flexure
   - shear
   - optional torsion
-- Still outside the present audit scope:
-  - deflection
+  - deflection, except for cantilever mockup-only placeholders
 
 The audited scope is limited to:
 
@@ -41,12 +40,16 @@ The audited scope is limited to:
 | Torsion | Minimum torsion steel | ACI 318-99 `11.6.5`; ACI 318-11 `11.5.5`; ACI 318-14/19 `9.6.4` | Audited | Implemented by code branch |
 | Torsion | Torsion stirrup spacing limit | ACI 318-99 `11.6.6.1`; ACI 318-11 `11.5.6.1`; ACI 318-14/19 `25.7.1.2` | Audited | Shared closed-stirrup presentation remains app-specific |
 | Torsion | Alternative procedure flag | ACI 318-19 `9.5.4.6` | Audited | Detection only; alternative procedure itself is not implemented |
+| Deflection | Uniform-load immediate deflection workflow | ACI 318-99/11 `9.5.2`; ACI 318-14 `24.2.3`; ACI 318-19 `24.2.3` | Audited | Direct-calculation beam workflow with code-specific Ie routing |
+| Deflection | Effective moment of inertia using cracked-section direct calculation | ACI 318-99/11 `9.5.2.3`; ACI 318-14 `24.2.3.5a`; ACI 318-19 Table `24.2.3.5` | Audited | ACI 318-19 path uses the Table `24.2.3.5` inverse Bischoff/Scanlon expression |
+| Deflection | Long-term deflection multiplier | ACI 318-99/11 `9.5.2.5`; ACI 318-14/19 Chapter `24.2.4` | Audited for implemented workbook-based workflow | Uses the app's `x / (1 + 50 rho')` long-term multiplier input path |
+| Deflection | User-selected allowable deflection limit | User-selected project serviceability limit | Audited | Engineer-selected `L / n` limit; app does not guess the project requirement |
 
 ## Remaining Review Items
 
 The following items are intentionally still marked for engineering review:
 
-1. Deflection logic is not yet reconstructed and remains outside the current audit.
+1. Cantilever deflection remains mockup-only in the current app.
 2. Any member type outside the present scope, such as flanged sections, prestressed members, or special seismic detailing, remains outside this audit.
 
 ## Transparency Notes

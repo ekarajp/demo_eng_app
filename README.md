@@ -178,10 +178,43 @@ results = design_torsion_beam(
 )
 ```
 
+### Deflection module
+
+```python
+from design.deflection import (
+    AllowableDeflectionLimitInput,
+    AllowableDeflectionPreset,
+    DeflectionCodeVersion,
+    DeflectionDesignInput,
+    DeflectionMemberType,
+    DeflectionServiceLoadInput,
+    DeflectionSupportCondition,
+    design_deflection_check,
+)
+
+results = design_deflection_check(
+    DeflectionDesignInput(
+        code_version=DeflectionCodeVersion.ACI318_14,
+        member_type=DeflectionMemberType.SIMPLE_BEAM,
+        support_condition=DeflectionSupportCondition.SIMPLE,
+        allowable_limit=AllowableDeflectionLimitInput(
+            preset=AllowableDeflectionPreset.L_360,
+        ),
+        span_length_m=4.0,
+        service_loads=DeflectionServiceLoadInput(
+            dead_load_kgf_per_m=300.0,
+            live_load_kgf_per_m=200.0,
+            sustained_live_load_ratio=0.3,
+        ),
+    )
+)
+```
+
 ## Notes
 
 - `apps/singly_beam/formulas.py` now acts mainly as a compatibility layer that maps app models into reusable engine packages.
 - `engines/moment` and `engines/shear` contain extracted reusable calculation logic.
 - `engines/torsion` is scaffolded as the public engine path and currently delegates to the existing torsion implementation under `design/torsion`.
+- `design/deflection` contains the reusable deflection workflow used by the Singly Beam app.
 - The structure is prepared for future engines such as development length, columns, footings, and slabs.
-- The clause audit in this repository currently covers beam `moment`, `shear`, and `torsion` for the implemented rectangular nonprestressed scope. `Deflection` remains outside the current audit scope.
+- The deflection module is now implemented with code-specific paths for ACI 318-99/11/14/19, including the ACI 318-19 Table 24.2.3.5 effective-moment-of-inertia path for nonprestressed members.

@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 import math
 
+from design.deflection import (
+    AllowableDeflectionLimitInput,
+    AllowableDeflectionPreset,
+    DeflectionCodeVersion,
+    DeflectionIeMethod,
+    DeflectionMemberType,
+    DeflectionSupportCondition,
+)
 from design.torsion import TorsionDesignInput, TorsionDesignResults
 
 
@@ -241,9 +249,19 @@ class NegativeBendingInput:
 
 @dataclass(slots=True)
 class DeflectionCheckInput:
+    design_code: DeflectionCodeVersion = DeflectionCodeVersion.ACI318_19
+    member_type: DeflectionMemberType = DeflectionMemberType.SIMPLE_BEAM
+    support_condition: DeflectionSupportCondition = DeflectionSupportCondition.SIMPLE
+    allowable_limit_preset: AllowableDeflectionPreset = AllowableDeflectionPreset.L_240
+    allowable_limit_custom_denominator: int | None = None
+    ie_method: DeflectionIeMethod = DeflectionIeMethod.WORST_CASE
+    long_term_factor_x: float = 2.0
+    service_dead_load_kgf_per_m: float = 0.0
+    service_live_load_kgf_per_m: float = 0.0
+    additional_sustained_load_kgf_per_m: float = 0.0
     beam_type: DeflectionBeamType = DeflectionBeamType.SINGLE_SPAN
     beam_type_factor_x: float = 2.0
-    span_length_m: float = 10.84
+    span_length_m: float = 1.0
     sustained_live_load_ratio: float = 0.3
     midspan_dead_load_service_moment_kgm: float = 30059.0
     midspan_live_load_service_moment_kgm: float = 18590.0
@@ -257,15 +275,33 @@ class DeflectionCheckInput:
     )
 
     def __post_init__(self) -> None:
+        _validate_positive(self.long_term_factor_x, "long_term_factor_x")
         _validate_positive(self.beam_type_factor_x, "beam_type_factor_x")
         _validate_positive(self.span_length_m, "span_length_m")
+        _validate_non_negative(self.service_dead_load_kgf_per_m, "service_dead_load_kgf_per_m")
+        _validate_non_negative(self.service_live_load_kgf_per_m, "service_live_load_kgf_per_m")
+        _validate_non_negative(self.additional_sustained_load_kgf_per_m, "additional_sustained_load_kgf_per_m")
         _validate_non_negative(self.sustained_live_load_ratio, "sustained_live_load_ratio")
         _validate_non_negative(self.midspan_dead_load_service_moment_kgm, "midspan_dead_load_service_moment_kgm")
         _validate_non_negative(self.midspan_live_load_service_moment_kgm, "midspan_live_load_service_moment_kgm")
-        _validate_non_negative(self.support_dead_load_service_moment_kgm, "support_dead_load_service_moment_kgm")
-        _validate_non_negative(self.support_live_load_service_moment_kgm, "support_live_load_service_moment_kgm")
+        if self.support_dead_load_service_moment_kgm > 0.0:
+            raise ValueError("support_dead_load_service_moment_kgm must be zero or negative.")
+        if self.support_live_load_service_moment_kgm > 0.0:
+            raise ValueError("support_live_load_service_moment_kgm must be zero or negative.")
+        if self.sustained_live_load_ratio > 1.0:
+            raise ValueError("sustained_live_load_ratio must be between 0.0 and 1.0.")
+        if self.allowable_limit_preset == AllowableDeflectionPreset.CUSTOM:
+            if self.allowable_limit_custom_denominator is None or self.allowable_limit_custom_denominator <= 0:
+                raise ValueError("allowable_limit_custom_denominator must be provided when the preset is Custom.")
         self.immediate_deflection_limit_description = self.immediate_deflection_limit_description.strip()
         self.total_deflection_limit_description = self.total_deflection_limit_description.strip()
+
+    @property
+    def allowable_limit(self) -> AllowableDeflectionLimitInput:
+        return AllowableDeflectionLimitInput(
+            preset=self.allowable_limit_preset,
+            custom_denominator=self.allowable_limit_custom_denominator,
+        )
 
 
 @dataclass(slots=True)
@@ -434,6 +470,57 @@ class DeflectionCheckResults:
     status: str
     note: str
     verification_status: VerificationStatus
+    code_version: str = ""
+    member_type: str = ""
+    support_condition: str = ""
+    ie_method_selected: str = ""
+    ie_method_governing: str = ""
+    allowable_limit_label: str = ""
+    allowable_limit_denominator: int = 0
+    allowable_deflection_cm: float = 0.0
+    span_length_m: float = 0.0
+    load_basis_note: str = ""
+    pass_fail_summary: str = ""
+    mockup_only: bool = False
+    immediate_clause: str = ""
+    long_term_clause: str = ""
+    limit_clause: str = ""
+    service_dead_load_kgf_per_m: float = 0.0
+    service_live_load_kgf_per_m: float = 0.0
+    additional_sustained_load_kgf_per_m: float = 0.0
+    sustained_live_load_ratio: float = 0.0
+    service_sustained_load_kgf_per_m: float = 0.0
+    midspan_dead_load_service_moment_kgm: float = 0.0
+    midspan_live_load_service_moment_kgm: float = 0.0
+    support_dead_load_service_moment_kgm: float = 0.0
+    support_live_load_service_moment_kgm: float = 0.0
+    gross_moment_of_inertia_cm4: float = 0.0
+    midspan_cracking_moment_kgm: float = 0.0
+    support_cracking_moment_kgm: float | None = None
+    midspan_cracked_neutral_axis_cm: float = 0.0
+    support_cracked_neutral_axis_cm: float | None = None
+    midspan_cracked_inertia_cm4: float = 0.0
+    support_cracked_inertia_cm4: float | None = None
+    ie_midspan_total_cm4: float = 0.0
+    ie_support_total_cm4: float | None = None
+    ie_average_total_cm4: float | None = None
+    ie_dead_cm4: float = 0.0
+    ie_total_cm4: float = 0.0
+    ie_sustained_cm4: float = 0.0
+    method_1_total_service_deflection_cm: float = 0.0
+    method_2_total_service_deflection_cm: float | None = None
+    immediate_dead_deflection_cm: float = 0.0
+    immediate_total_deflection_cm: float = 0.0
+    immediate_live_deflection_cm: float = 0.0
+    sustained_initial_deflection_cm: float = 0.0
+    long_term_multiplier: float = 0.0
+    additional_long_term_deflection_cm: float = 0.0
+    total_service_deflection_cm: float = 0.0
+    calculated_deflection_cm: float = 0.0
+    capacity_ratio: float = 0.0
+    governing_result: str = ""
+    warnings: tuple[str, ...] = ()
+    steps: tuple[object, ...] = ()
 
 
 @dataclass(slots=True)

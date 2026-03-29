@@ -1,6 +1,7 @@
 import pytest
 
 from apps.singly_beam.formulas import (
+    _auto_select_spacing_cm,
     calculate_beam_geometry,
     calculate_full_design_results,
     calculate_material_properties,
@@ -12,6 +13,7 @@ from apps.singly_beam.formulas import (
 from apps.singly_beam.models import (
     BeamDesignInputSet,
     BeamType,
+    DeflectionCheckInput,
     MaterialPropertyMode,
     MaterialPropertySetting,
     MaterialPropertySettings,
@@ -22,6 +24,7 @@ from apps.singly_beam.models import (
     ShearDesignInput,
     ShearSpacingMode,
 )
+from design.deflection import DeflectionCodeVersion, DeflectionMemberType, DeflectionSupportCondition
 from design.torsion import TorsionDemandType, TorsionDesignCode, TorsionDesignInput
 
 
@@ -307,6 +310,37 @@ def test_manual_spacing_can_fail_combined_shear_and_torsion_spacing_limit() -> N
     assert results.combined_shear_torsion.design_status == "FAIL"
 
 
+def test_combined_shear_torsion_uses_nonzero_shear_interaction_component() -> None:
+    inputs = BeamDesignInputSet(
+        shear=ShearDesignInput(
+            factored_shear_kg=5000.0,
+            stirrup_diameter_mm=9,
+            legs_per_plane=2,
+            spacing_mode=ShearSpacingMode.MANUAL,
+            provided_spacing_cm=15.0,
+        ),
+        torsion=TorsionDesignInput(
+            enabled=True,
+            factored_torsion_kgfm=500.0,
+            design_code=TorsionDesignCode.ACI318_19,
+            demand_type=TorsionDemandType.EQUILIBRIUM,
+            provided_longitudinal_bar_diameter_mm=16,
+            provided_longitudinal_bar_count=4,
+            provided_longitudinal_bar_fy_ksc=4000.0,
+        ),
+    )
+
+    results = calculate_full_design_results(inputs)
+
+    assert results.combined_shear_torsion.shear_required_transverse_mm2_per_mm == pytest.approx(0.10429860706608919)
+    assert results.combined_shear_torsion.capacity_ratio == pytest.approx(1.2390049351846555)
+
+
+def test_auto_spacing_is_not_reduced_below_5_cm() -> None:
+    assert _auto_select_spacing_cm(4.2) == pytest.approx(5.0)
+    assert _auto_select_spacing_cm(2.5) == pytest.approx(5.0)
+
+
 def test_passing_torsion_design_does_not_trigger_requirement_status_from_basis_note() -> None:
     inputs = BeamDesignInputSet(
         beam_type=BeamType.SIMPLE,
@@ -354,14 +388,25 @@ def test_full_results_expose_review_flags_and_overall_status() -> None:
     assert len(results.review_flags) == 0
 
 
-def test_full_results_only_expose_deflection_review_flag_when_requested() -> None:
-    results = calculate_full_design_results(BeamDesignInputSet(consider_deflection=True))
+def test_full_results_include_deflection_without_forcing_review_flag() -> None:
+    results = calculate_full_design_results(
+        BeamDesignInputSet(
+            consider_deflection=True,
+            deflection=DeflectionCheckInput(
+                design_code=DeflectionCodeVersion.ACI318_14,
+                member_type=DeflectionMemberType.SIMPLE_BEAM,
+                support_condition=DeflectionSupportCondition.SIMPLE,
+                span_length_m=4.0,
+                service_dead_load_kgf_per_m=300.0,
+                service_live_load_kgf_per_m=200.0,
+                sustained_live_load_ratio=0.3,
+            ),
+        )
+    )
 
-    assert results.overall_status == "PASS WITH REVIEW"
-    assert len(results.review_flags) == 1
-    assert results.review_flags[0].title == "Deflection module"
-    assert results.review_flags[0].severity == "warning"
-    assert "Deflection logic has not been fully reconstructed into code yet" in results.review_flags[0].message
+    assert results.overall_status == "PASS"
+    assert len(results.review_flags) == 0
+    assert results.deflection.status == "PASS"
 
 
 def test_simple_beam_omits_negative_results() -> None:
