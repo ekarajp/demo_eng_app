@@ -1,0 +1,10 @@
+.venv/
+.idea/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+.streamlit/workspace_state.json
+
+Thumbs.db
+Desktop.ini
