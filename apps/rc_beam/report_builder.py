@@ -7,7 +7,8 @@ from design.torsion.torsion_units import mm2_to_cm2, mm_to_cm
 from core.theme import ThemePalette
 from core.utils import format_number, format_ratio, longitudinal_bar_mark, stirrup_bar_mark
 
-from .models import BeamBehaviorMode, BeamDesignInputSet, BeamDesignResults, ReinforcementArrangementInput, VerificationStatus
+from .formulas import calculate_beam_geometry
+from .models import BeamBehaviorMode, BeamDesignInputSet, BeamDesignResults, BeamType, ReinforcementArrangementInput, VerificationStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,53 @@ class SummaryReportData:
     reinforcement_lines: tuple[str, ...]
     governing_notes: tuple[str, ...]
     conclusion: str
+
+
+def _active_section_names(inputs: BeamDesignInputSet) -> str:
+    return ", ".join(label for _, label in inputs.active_flexural_sections)
+
+
+def _cantilever_span_summary(inputs: BeamDesignInputSet) -> str | None:
+    if inputs.beam_type.value == "Standalone Cantilever Beam":
+        return None
+    return "Yes" if inputs.include_cantilever_span else "No"
+
+
+def _mu_mapping_text(inputs: BeamDesignInputSet) -> str:
+    return "; ".join(f"{label} -> {section_label}" for label, _, section_label in inputs.active_mu_region_mappings)
+
+
+def _vu_mapping_text(inputs: BeamDesignInputSet) -> str:
+    return "; ".join(
+        f"{region_label} -> {section_label}" for _, region_label, _, section_label in inputs.active_vu_region_mappings
+    )
+
+
+def _primary_section_label(inputs: BeamDesignInputSet) -> str:
+    if not inputs.has_positive_design and inputs.has_cantilever_negative_design:
+        return "Cantilever Negative"
+    if inputs.beam_type == BeamType.SIMPLE:
+        return "Middle"
+    return "Positive"
+
+
+def _shear_basis_text(results: BeamDesignResults) -> str:
+    return f"{results.shear.design_section_label} section"
+
+
+def _shear_effective_depth_text(results: BeamDesignResults) -> str:
+    return format_number(results.shear.effective_depth_cm)
+
+
+def _negative_section_effective_depth_text(inputs: BeamDesignInputSet, bending_input) -> str:
+    geometry_results = calculate_beam_geometry(
+        inputs.geometry,
+        inputs.positive_bending,
+        bending_input,
+        inputs.shear,
+        include_negative=True,
+    )
+    return format_number(geometry_results.d_minus_cm) if geometry_results.d_minus_cm is not None else "N/A"
 
 
 def _moment_capacity_row_content(
@@ -82,194 +130,6 @@ def _with_updated_moment_summary_row(section: ReportSection, flexural_result) ->
     return ReportSection(title=section.title, rows=rows)
 
 
-def build_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
-    sections = [
-        _build_input_summary(inputs),
-        _build_material_section(inputs, results),
-        _build_geometry_section(inputs, results),
-        _build_positive_section(inputs, results),
-    ]
-    sections[3] = _with_updated_moment_summary_row(sections[3], results.positive_bending)
-    if inputs.has_negative_design and results.negative_bending is not None:
-        sections.append(_with_updated_moment_summary_row(_build_negative_section(inputs, results), results.negative_bending))
-    sections.append(_build_shear_section(inputs, results))
-    if inputs.torsion.enabled:
-        sections.append(_build_torsion_section(inputs, results))
-    if inputs.consider_deflection:
-        sections.append(_build_deflection_section(results))
-    sections.append(_build_summary_section(inputs, results))
-    return sections
-
-
-def build_print_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
-    input_summary_rows = [
-        ReportRow("Design Code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
-        ReportRow("Beam Behavior", "-", _beam_behavior_mode_summary(inputs), _beam_behavior_mode_summary(inputs), "-"),
-        ReportRow(
-            "Geometry",
-            f"{_sym_b()} x {_sym_h()}, cover",
-            f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)}, c={format_number(inputs.geometry.cover_cm)}",
-            f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)} / {format_number(inputs.geometry.cover_cm)}",
-            "cm",
-        ),
-        ReportRow(
-            "Mu",
-            "-",
-            _print_input_mu_value(inputs),
-            _print_input_mu_value(inputs),
-            "kg-m",
-        ),
-        ReportRow("Vu", "-", format_number(inputs.shear.factored_shear_kg), format_number(inputs.shear.factored_shear_kg), "kg"),
-    ]
-    sections = [
-        ReportSection(
-            title="Input Summary",
-            rows=input_summary_rows,
-        ),
-        ReportSection(
-            title="Material Properties",
-            rows=[
-                ReportRow(
-                    f"{_sym_fc()}, {_sym_fy()}, {_sym_fvy()}",
-                    "-",
-                    f"{format_number(inputs.materials.concrete_strength_ksc)} / {format_number(inputs.materials.main_steel_yield_ksc)} / {format_number(inputs.materials.shear_steel_yield_ksc)}",
-                    f"{format_number(inputs.materials.concrete_strength_ksc)} / {format_number(inputs.materials.main_steel_yield_ksc)} / {format_number(inputs.materials.shear_steel_yield_ksc)}",
-                    "ksc",
-                ),
-                ReportRow(_sym_ec(), _format_default_ec_logic(), _material_substitution(results.materials.ec_mode.value, results.materials.ec_default_ksc, inputs.material_settings.ec.manual_value), format_number(results.materials.ec_ksc), "ksc", results.materials.ec_mode.value, _material_note(results.materials.ec_mode.value, results.materials.ec_default_logic)),
-                ReportRow(_sym_es(), _format_default_es_logic(), _material_substitution(results.materials.es_mode.value, results.materials.es_default_ksc, inputs.material_settings.es.manual_value), format_number(results.materials.es_ksc), "ksc", results.materials.es_mode.value, _material_note(results.materials.es_mode.value, results.materials.es_default_logic)),
-                ReportRow(_sym_fr(), _format_default_fr_logic(), _material_substitution(results.materials.fr_mode.value, results.materials.fr_default_ksc, inputs.material_settings.fr.manual_value), format_number(results.materials.modulus_of_rupture_fr_ksc), "ksc", results.materials.fr_mode.value, _material_note(results.materials.fr_mode.value, results.materials.fr_default_logic)),
-                ReportRow(_sym_beta1(), "-", f"{_sym_fc()} = {format_number(inputs.materials.concrete_strength_ksc)}", format_ratio(results.materials.beta_1), "-", note=VerificationStatus.VERIFIED_CODE.value),
-            ],
-        ),
-        ReportSection(
-            title="Section Geometry",
-            rows=[
-                ReportRow("d′", "Compression steel centroid", "Layer centroid", format_number(results.beam_geometry.positive_compression_centroid_d_prime_cm), "cm"),
-                ReportRow("d", "Tension steel centroid", "Layer centroid", format_number(results.beam_geometry.d_plus_cm), "cm", note="Positive effective depth"),
-                ReportRow("Spacing", "Positive tension spacing", results.beam_geometry.positive_tension_spacing.overall_status, results.beam_geometry.positive_tension_spacing.overall_status, "-"),
-            ],
-        ),
-        ReportSection(
-            title="Positive Moment Design",
-            rows=[
-                ReportRow("Tension Reinforcement", "Bottom bars", _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
-                ReportRow("Compression Reinforcement", "Top bars", _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Top bars"),
-                ReportRow(f"{_sym_as_req()} / {_sym_as_prov()}", f"{_sym_rho_req()} {_sym_b()} d, sum(bar areas)", "Positive bending", f"{format_number(results.positive_bending.as_required_cm2)} / {format_number(results.positive_bending.as_provided_cm2)}", _unit_cm2(), results.positive_bending.as_status),
-                ReportRow(f"{_sym_mn()} / {_sym_phi_mn()}", f"{_sym_as()} {_sym_fy()} (d - a/2), φ{_sym_mn()}", "Positive bending", f"{format_number(results.positive_bending.mn_kgm)} / {format_number(results.positive_bending.phi_mn_kgm)}", "kg-m", results.positive_bending.design_status),
-            ],
-        ),
-    ]
-    if inputs.has_negative_design and results.negative_bending is not None:
-        sections.append(
-            ReportSection(
-                title="Negative Moment Design",
-                rows=[
-                    ReportRow("Tension Reinforcement", "Top bars", _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
-                    ReportRow("Compression Reinforcement", "Bottom bars", _format_arrangement(inputs.negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Bottom bars"),
-                    ReportRow("As req. / prov.", "rho_req * b * d-, sum(bar areas)", "Negative bending", f"{format_number(results.negative_bending.as_required_cm2)} / {format_number(results.negative_bending.as_provided_cm2)}", "cm2", results.negative_bending.as_status),
-                    ReportRow("Mn / phiMn", _moment_capacity_summary_equation(results.negative_bending, "As * fy * (d- - a/2), phi*Mn"), "Negative bending", f"{format_number(results.negative_bending.mn_kgm)} / {format_number(results.negative_bending.phi_mn_kgm)}", "kg-m", results.negative_bending.design_status),
-                ],
-            )
-        )
-    sections.append(
-        ReportSection(
-            title="Shear Design",
-            rows=[
-                ReportRow(f"{_sym_vu()} / {_sym_phi_vc()}", "Demand / concrete capacity", format_number(inputs.shear.factored_shear_kg), format_number(results.shear.phi_vc_kg), "kg", results.shear.design_status),
-                ReportRow("Req. spacing", "governing spacing s", "Strength and code spacing limits", format_number(results.shear.required_spacing_cm), "cm", results.shear.design_status),
-                ReportRow("Prov. spacing", f"{results.shear.spacing_mode.value} spacing", f"db={inputs.shear.stirrup_diameter_mm} mm, legs={inputs.shear.legs_per_plane}", format_number(results.shear.provided_spacing_cm), "cm", results.shear.design_status),
-                ReportRow(_sym_phi_vs(), f"φ {_sym_av()} {_sym_fvy()} d / s", f"{results.shear.phi:.3f} x {_sym_av()} x {format_number(inputs.materials.shear_steel_yield_ksc)} x d / {format_number(results.shear.provided_spacing_cm)}", format_number(results.shear.phi_vs_provided_kg), "kg"),
-                ReportRow(f"{_sym_vn()} / {_sym_phi_vn()}", f"{_sym_vc()} + {_sym_vs()}(provided), φ{_sym_vn()}", f"{format_number(results.shear.vn_kg)} / {format_number(results.shear.phi_vn_kg)}", f"{format_number(results.shear.vn_kg)} / {format_number(results.shear.phi_vn_kg)}", "kg", results.shear.design_status),
-                ReportRow("Shear capacity ratio", f"{_sym_vu()} / {_sym_phi_vn()}", f"{format_number(inputs.shear.factored_shear_kg)} / {format_number(results.shear.phi_vn_kg)}", format_ratio(results.shear.capacity_ratio), "-", results.shear.design_status),
-            ],
-        )
-    )
-    if inputs.torsion.enabled:
-        sections.append(_build_print_torsion_section(results))
-    if inputs.consider_deflection:
-        sections.append(_build_print_deflection_section(results))
-    sections.append(_build_print_design_summary(inputs, results))
-    sections[3] = _with_updated_moment_summary_row(sections[3], results.positive_bending)
-    if inputs.has_negative_design and results.negative_bending is not None:
-        sections[4] = _with_updated_moment_summary_row(sections[4], results.negative_bending)
-    return sections
-
-
-def build_summary_table_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
-    sections = [
-        ReportSection(
-            title="Member Summary",
-            rows=[
-                ReportRow("Beam Type", "-", inputs.beam_type.value, inputs.beam_type.value, "-"),
-                ReportRow("Beam Behavior", "-", inputs.beam_behavior_mode.value, inputs.beam_behavior_mode.value, "-"),
-                ReportRow(
-                    "Threshold R",
-                    "-",
-                    f"{format_number(inputs.auto_beam_behavior_threshold_ratio * 100.0)}%",
-                    f"{format_number(inputs.auto_beam_behavior_threshold_ratio * 100.0)}%",
-                    "%",
-                ),
-                ReportRow("Code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
-                ReportRow(
-                    "Section",
-                    "-",
-                    f"{format_number(inputs.geometry.width_cm)} × {format_number(inputs.geometry.depth_cm)} cm, c={format_number(inputs.geometry.cover_cm)} cm",
-                    f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)}",
-                    "cm",
-                ),
-                ReportRow(
-                    "Materials",
-                    "-",
-                    f"f'c {format_number(inputs.materials.concrete_strength_ksc)}, fy {format_number(inputs.materials.main_steel_yield_ksc)}, fvy {format_number(inputs.materials.shear_steel_yield_ksc)}",
-                    f"{format_number(inputs.materials.concrete_strength_ksc)} / {format_number(inputs.materials.main_steel_yield_ksc)} / {format_number(inputs.materials.shear_steel_yield_ksc)}",
-                    "ksc",
-                ),
-                ReportRow("Mu(+)", "-", format_number(inputs.positive_bending.factored_moment_kgm), format_number(inputs.positive_bending.factored_moment_kgm), "kgf-m"),
-                ReportRow("Vu", "-", format_number(inputs.shear.factored_shear_kg), format_number(inputs.shear.factored_shear_kg), "kgf"),
-            ],
-        ),
-        _build_summary_table_flexure_section(inputs, results),
-        _build_summary_table_shear_section(inputs, results),
-        _build_summary_reinforcement_section(inputs, results),
-        _build_print_design_summary(inputs, results),
-    ]
-    if inputs.has_negative_design and results.negative_bending is not None:
-        sections[0].rows.append(
-            ReportRow("Mu(-)", "-", format_number(inputs.negative_bending.factored_moment_kgm), format_number(inputs.negative_bending.factored_moment_kgm), "kgf-m")
-        )
-    if inputs.torsion.enabled:
-        sections[0].rows.append(
-            ReportRow("Tu", "-", format_number(inputs.torsion.factored_torsion_kgfm), format_number(inputs.torsion.factored_torsion_kgfm), "kgf-m")
-        )
-        sections.insert(3, _build_summary_table_torsion_section(results))
-    if inputs.consider_deflection and results.deflection.status != "Not considered":
-        sections.insert(-2, _build_summary_table_deflection_section(results))
-    return sections
-
-
-def build_full_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
-    sections = [
-        _build_full_input_summary(inputs),
-        _build_full_material_section(inputs, results),
-        _build_full_geometry_section(inputs, results),
-        _build_full_positive_section(inputs, results),
-        _build_full_spacing_section(inputs, results),
-        _build_full_shear_section(inputs, results),
-    ]
-    if inputs.torsion.enabled:
-        sections.append(_build_full_torsion_section(results))
-    if inputs.consider_deflection:
-        sections.append(_build_full_deflection_section(results))
-    if inputs.has_negative_design and results.negative_bending is not None:
-        sections.append(_build_full_negative_section(inputs, results))
-    if results.warnings:
-        sections.append(_build_full_warning_section(results))
-    if results.review_flags:
-        sections.append(_build_full_review_flag_section(results))
-    return sections
-
-
 def build_summary_report_data(inputs: BeamDesignInputSet, results: BeamDesignResults) -> SummaryReportData:
     check_sections = [
         _build_flexure_summary_section(inputs, results),
@@ -297,62 +157,6 @@ def build_full_report_overview_data(inputs: BeamDesignInputSet, results: BeamDes
     return build_summary_report_data(inputs, results)
 
 
-def _build_summary_table_flexure_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
-    rows = [
-        ReportRow(
-            "Positive Flexure",
-            "-",
-            (
-                f"M<sub>u</sub> {format_number(inputs.positive_bending.factored_moment_kgm)} | "
-                f"&phi;M<sub>n</sub> {format_number(results.positive_bending.phi_mn_kgm)} | "
-                f"{_beam_behavior_report_text(results.positive_bending)}"
-            ),
-            format_ratio(results.positive_bending.ratio),
-            "-",
-            results.positive_bending.design_status,
-            _summary_label(results.positive_bending.as_status),
-        ),
-        ReportRow(
-            "Positive Behavior",
-            "-",
-            _beam_behavior_report_text(results.positive_bending),
-            results.positive_bending.effective_beam_behavior,
-            "-",
-            results.positive_bending.design_status,
-        ),
-    ]
-    if inputs.has_negative_design and results.negative_bending is not None:
-        rows.append(
-            ReportRow(
-                "Negative Flexure",
-                "-",
-                (
-                    f"M<sub>u</sub> {format_number(inputs.negative_bending.factored_moment_kgm)} | "
-                    f"&phi;M<sub>n</sub> {format_number(results.negative_bending.phi_mn_kgm)} | "
-                    f"{_beam_behavior_report_text(results.negative_bending)}"
-                ),
-                format_ratio(results.negative_bending.ratio),
-                "-",
-                results.negative_bending.design_status,
-                _summary_label(results.negative_bending.as_status),
-            )
-        )
-        rows.append(
-            ReportRow(
-                "Negative Behavior",
-                "-",
-                _beam_behavior_report_text(results.negative_bending),
-                results.negative_bending.effective_beam_behavior,
-                "-",
-                results.negative_bending.design_status,
-            )
-        )
-    rows.append(
-        ReportRow("d", "-", "-", format_number(results.beam_geometry.d_plus_cm), "cm")
-    )
-    return ReportSection(title="Flexure", rows=rows)
-
-
 def _build_summary_table_shear_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
     combined = results.combined_shear_torsion
     if combined.active:
@@ -373,6 +177,7 @@ def _build_summary_table_shear_section(inputs: BeamDesignInputSet, results: Beam
                 format_number(combined.stirrup_spacing_cm),
                 "cm",
             ),
+            ReportRow("Basis", "-", f"{_shear_basis_text(results)}, d = {_shear_effective_depth_text(results)} cm", results.shear.design_section_label, "-", combined.design_status),
         ]
         if combined.cross_section_limit_check_applied:
             rows.append(
@@ -399,6 +204,7 @@ def _build_summary_table_shear_section(inputs: BeamDesignInputSet, results: Beam
                 results.shear.design_status,
                 _summary_label(results.shear.review_note or results.shear.section_change_note),
             ),
+            ReportRow("Basis", "-", f"{_shear_basis_text(results)}, d = {_shear_effective_depth_text(results)} cm", results.shear.design_section_label, "-", results.shear.design_status),
             ReportRow(
                 "Stirrups",
                 "-",
@@ -454,53 +260,6 @@ def _build_summary_table_deflection_section(results: BeamDesignResults) -> Repor
             ReportRow("Ratio", "-", "-", format_ratio(deflection.capacity_ratio), "-", deflection.status),
         ],
     )
-
-
-def _build_summary_reinforcement_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
-    rows = [
-        ReportRow(
-            "Bottom Steel",
-            "-",
-            _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc),
-            _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc),
-            "-",
-        ),
-        ReportRow(
-            "Top Steel",
-            "-",
-            _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc),
-            _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc),
-            "-",
-        ),
-        ReportRow(
-            "Stirrups",
-            "-",
-            f"{stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm}, {inputs.shear.legs_per_plane}-leg @ {format_number(results.combined_shear_torsion.stirrup_spacing_cm if results.combined_shear_torsion.active else results.shear.provided_spacing_cm)} cm",
-            f"{format_number(results.combined_shear_torsion.stirrup_spacing_cm if results.combined_shear_torsion.active else results.shear.provided_spacing_cm)}",
-            "cm",
-        ),
-    ]
-    if inputs.has_negative_design and results.negative_bending is not None:
-        rows.append(
-            ReportRow(
-                "Support Top Steel",
-                "-",
-                _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc),
-                _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc),
-                "-",
-            )
-        )
-    if inputs.torsion.enabled and not results.combined_shear_torsion.torsion_ignored and inputs.torsion.provided_longitudinal_bar_diameter_mm is not None:
-        rows.append(
-            ReportRow(
-                "Torsion Long. Steel",
-                "-",
-                f"{inputs.torsion.provided_longitudinal_bar_count}-{longitudinal_bar_mark(inputs.torsion.provided_longitudinal_bar_fy_ksc)}{inputs.torsion.provided_longitudinal_bar_diameter_mm}",
-                f"{inputs.torsion.provided_longitudinal_bar_count}-{longitudinal_bar_mark(inputs.torsion.provided_longitudinal_bar_fy_ksc)}{inputs.torsion.provided_longitudinal_bar_diameter_mm}",
-                "-",
-            )
-        )
-    return ReportSection(title="Reinforcement Summary", rows=rows)
 
 
 def build_report_print_css(palette: ThemePalette) -> str:
@@ -1352,19 +1111,6 @@ def build_full_report_print_css(palette: ThemePalette) -> str:
     """
 
 
-def _build_input_summary(inputs: BeamDesignInputSet) -> ReportSection:
-    return ReportSection(
-        title="Input Summary",
-        rows=[
-            ReportRow("Design code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
-            ReportRow("fc'", "-", format_number(inputs.materials.concrete_strength_ksc), format_number(inputs.materials.concrete_strength_ksc), "ksc"),
-            ReportRow("fy", "-", format_number(inputs.materials.main_steel_yield_ksc), format_number(inputs.materials.main_steel_yield_ksc), "ksc"),
-            ReportRow("b", "-", format_number(inputs.geometry.width_cm), format_number(inputs.geometry.width_cm), "cm"),
-            ReportRow("h", "-", format_number(inputs.geometry.depth_cm), format_number(inputs.geometry.depth_cm), "cm"),
-        ],
-    )
-
-
 def _build_material_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
     return ReportSection(
         title="Material Properties",
@@ -1416,12 +1162,13 @@ def _build_material_section(inputs: BeamDesignInputSet, results: BeamDesignResul
 
 
 def _build_geometry_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    primary_section_label = _primary_section_label(inputs)
     rows = [
         ReportRow("Section area", "b * h", f"{inputs.geometry.width_cm:.2f} * {inputs.geometry.depth_cm:.2f}", format_number(results.beam_geometry.section_area_cm2), "cm2"),
         ReportRow("Ig", "b * h^3 / 12", f"{inputs.geometry.width_cm:.2f} * {inputs.geometry.depth_cm:.2f}^3 / 12", format_number(results.beam_geometry.gross_moment_of_inertia_cm4), "cm4"),
         ReportRow("d'", "Top compression steel centroid", "Layer centroid calculation", format_number(results.beam_geometry.positive_compression_centroid_d_prime_cm), "cm", note="Compression reinforcement"),
-        ReportRow("d", "Bottom tension steel centroid", "Layer centroid calculation", format_number(results.beam_geometry.positive_tension_centroid_from_bottom_d_cm), "cm", note="Tension reinforcement"),
-        ReportRow("d+", "h - d", f"{inputs.geometry.depth_cm:.2f} - {results.beam_geometry.positive_tension_centroid_from_bottom_d_cm:.2f}", format_number(results.beam_geometry.d_plus_cm), "cm", note="Positive effective depth"),
+        ReportRow("d", "Bottom tension steel centroid", "Layer centroid calculation", format_number(results.beam_geometry.positive_tension_centroid_from_bottom_d_cm), "cm", note=f"{primary_section_label} tension reinforcement"),
+        ReportRow("d+", "h - d", f"{inputs.geometry.depth_cm:.2f} - {results.beam_geometry.positive_tension_centroid_from_bottom_d_cm:.2f}", format_number(results.beam_geometry.d_plus_cm), "cm", note=f"{primary_section_label} effective depth"),
     ]
     if inputs.has_negative_design and results.beam_geometry.d_minus_cm is not None:
         rows.append(
@@ -1448,7 +1195,7 @@ def _build_positive_section(inputs: BeamDesignInputSet, results: BeamDesignResul
         ),
     )
     return ReportSection(
-        title="Positive Moment Design",
+        title="Middle Moment Design" if inputs.beam_type == BeamType.SIMPLE else "Positive Moment Design",
         rows=[
             ReportRow("Tension Reinforcement", "Bottom bars", _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Bottom bars"),
             ReportRow("Compression Reinforcement", "Top bars", _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Top bars"),
@@ -1474,17 +1221,45 @@ def _build_positive_section(inputs: BeamDesignInputSet, results: BeamDesignResul
     )
 
 
+def _build_support_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    support = results.support_bending
+    if support is None:
+        raise ValueError("Support moment report section requested without support results.")
+    mn_equation, mn_substitution = _moment_capacity_row_content(
+        support,
+        default_equation="As * fy * (d - a/2) / 100",
+        default_substitution=(
+            f"{format_number(support.as_provided_cm2)} * {format_number(inputs.materials.main_steel_yield_ksc)} "
+            f"* ({format_number(results.beam_geometry.d_plus_cm)} - {format_number(support.a_cm)}/2) / 100"
+        ),
+    )
+    support_note = "Auto Mu at support - L/4 from simple beam moment diagram." if inputs.simple_support_bending.moment_mode.value == "Auto" else "Manual Mu at support - L/4."
+    return ReportSection(
+        title="Support Moment Design",
+        rows=[
+            ReportRow("Tension Reinforcement", "Bottom bars", _format_arrangement(inputs.simple_support_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.simple_support_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Bottom bars"),
+            ReportRow("Compression Reinforcement", "Top bars", _format_arrangement(inputs.simple_support_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.simple_support_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Top bars"),
+            ReportRow("Mu", "Support - L/4", support_note, format_number(inputs.resolved_simple_support_moment_kgm), "kg-m"),
+            ReportRow("Mn", mn_equation, mn_substitution, format_number(support.mn_kgm), "kg-m"),
+            ReportRow("phiMn", "phi * Mn", f"{support.phi:.3f} * {support.mn_kgm:.2f}", format_number(support.phi_mn_kgm), "kg-m", support.ratio_status),
+            ReportRow("Moment capacity ratio", "Mu / PhiMn", f"{format_number(inputs.resolved_simple_support_moment_kgm)} / {format_number(support.phi_mn_kgm)}", format_ratio(support.ratio), "-", support.design_status),
+        ],
+    )
+
+
 def _build_shear_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
     shear = results.shear
     return ReportSection(
         title="Shear Design",
         rows=[
             ReportRow("phi", "Shear phi by selected code", inputs.metadata.design_code.value, format_ratio(shear.phi), "-", shear.design_status),
-            ReportRow("Vc", "0.53 * sqrt(fc') * b * d", "Current nominal concrete shear", format_number(shear.vc_kg), "kg"),
+            ReportRow("Shear basis", "Active flexural section controlling shear depth", _shear_basis_text(results), shear.design_section_label, "-", shear.design_status, shear.section_change_note),
+            ReportRow("d used for shear", "Effective depth used in Vc, Vs, and Vn", _shear_basis_text(results), _shear_effective_depth_text(results), "cm"),
+            ReportRow("Vc", "0.53 * sqrt(fc') * b * d", f"Current nominal concrete shear with d = {_shear_effective_depth_text(results)} cm", format_number(shear.vc_kg), "kg"),
             ReportRow("phiVc", "phi * Vc", f"{shear.phi:.3f} * {shear.vc_kg:.2f}", format_number(shear.phi_vc_kg), "kg"),
-            ReportRow("Vs,max", "2.1 * sqrt(fc') * b * d", "Current nominal steel shear limit", format_number(shear.vs_max_kg), "kg"),
+            ReportRow("Vs,max", "2.1 * sqrt(fc') * b * d", f"Current nominal steel shear limit with d = {_shear_effective_depth_text(results)} cm", format_number(shear.vs_max_kg), "kg"),
             ReportRow("phiVs,max", "phi * Vs,max", f"{format_ratio(shear.phi, 3)} * {format_number(shear.vs_max_kg)}", format_number(shear.phi_vs_max_kg), "kg"),
-            ReportRow("phiVs required", "Vu - phiVc", f"{format_number(inputs.shear.factored_shear_kg)} - {format_number(shear.phi_vc_kg)}", format_number(shear.phi_vs_required_kg), "kg"),
+            ReportRow("phiVs required", "Vu - phiVc", f"{format_number(shear.input_factored_shear_kg)} - {format_number(shear.phi_vc_kg)}", format_number(shear.phi_vs_required_kg), "kg"),
             ReportRow("Vs required", "phiVs required / phi", f"{format_number(shear.phi_vs_required_kg)} / {format_ratio(shear.phi, 3)}", format_number(shear.nominal_vs_required_kg), "kg"),
             ReportRow("Av", "pi * db^2 / 4 * legs", f"db={inputs.shear.stirrup_diameter_mm}, legs={inputs.shear.legs_per_plane}", format_number(shear.av_cm2), "cm2"),
             ReportRow("Av,min", "Minimum stirrup area at provided spacing", f"s = {format_number(shear.provided_spacing_cm)}", format_number(shear.av_min_cm2), "cm2", shear.design_status if shear.minimum_reinforcement_required and shear.av_cm2 < shear.av_min_cm2 else None),
@@ -1493,12 +1268,12 @@ def _build_shear_section(inputs: BeamDesignInputSet, results: BeamDesignResults)
             ReportRow("s max from Vs", "Code-style spacing limit", "Current branch logic", format_number(shear.s_max_from_vs_cm), "cm"),
             ReportRow("Required spacing", "min(s strength, s max from Av, s max from Vs)", "Governing required spacing", format_number(shear.required_spacing_cm), "cm"),
             ReportRow("Provided spacing", f"{shear.spacing_mode.value} selection", "Spacing used for PhiVs and PhiVn", format_number(shear.provided_spacing_cm), "cm", shear.design_status),
-            ReportRow("Vs", "Av * fvy * d / s", f"Use s = {format_number(shear.provided_spacing_cm)}", format_number(shear.vs_provided_kg), "kg"),
+            ReportRow("Vs", "Av * fvy * d / s", f"Use d = {_shear_effective_depth_text(results)} cm and s = {format_number(shear.provided_spacing_cm)} cm", format_number(shear.vs_provided_kg), "kg"),
             ReportRow("PhiVs", "phi * Vs", f"{shear.phi:.3f} * {format_number(shear.vs_provided_kg)}", format_number(shear.phi_vs_provided_kg), "kg"),
             ReportRow("Vn", "Vc + min(Vs, Vs,max)", f"{format_number(shear.vc_kg)} + min({format_number(shear.vs_provided_kg)}, {format_number(shear.vs_max_kg)})", format_number(shear.vn_kg), "kg"),
             ReportRow("PhiVn", "phi * Vn", f"{shear.phi:.3f} * {format_number(shear.vn_kg)}", format_number(shear.phi_vn_kg), "kg"),
             ReportRow("Stirrup spacing", "Provided spacing", f"{shear.spacing_mode.value} mode", format_number(shear.provided_spacing_cm), "cm", shear.design_status, shear.review_note),
-            ReportRow("Shear capacity ratio", "Vu / PhiVn", f"{format_number(inputs.shear.factored_shear_kg)} / {format_number(shear.phi_vn_kg)}", format_ratio(shear.capacity_ratio), "-", shear.design_status),
+            ReportRow("Shear capacity ratio", "Vu / PhiVn", f"{format_number(shear.input_factored_shear_kg)} / {format_number(shear.phi_vn_kg)}", format_ratio(shear.capacity_ratio), "-", shear.design_status),
         ],
     )
 
@@ -1582,50 +1357,6 @@ def _build_negative_section(inputs: BeamDesignInputSet, results: BeamDesignResul
     )
 
 
-def _build_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
-    combined = results.combined_shear_torsion
-    rows = [
-        ReportRow("Overall status", "-", results.overall_note, results.overall_status, "-", results.overall_note),
-        ReportRow("Positive flexure", "-", results.positive_bending.design_status, results.positive_bending.design_status, "-", results.positive_bending.as_status),
-    ]
-    if combined.active:
-        rows.append(
-            ReportRow(
-                "Shear & Torsion",
-                "-",
-                f"Capacity Ratio (Shear + Torsion) = {format_ratio(combined.capacity_ratio)}",
-                combined.design_status,
-                "-",
-                combined.design_status_note or f"\u03d5{combined.stirrup_diameter_mm} mm / {combined.stirrup_legs} legs @ {format_number(combined.stirrup_spacing_cm)} cm",
-            )
-        )
-    else:
-        rows.append(
-            ReportRow("Shear", "-", results.shear.design_status, results.shear.design_status, "-", f"{format_number(results.shear.provided_spacing_cm)} cm")
-        )
-    if inputs.torsion.enabled:
-        torsion_note = combined.ignore_message if combined.torsion_ignored else results.torsion.pass_fail_summary
-        rows.append(ReportRow("Torsion", "-", torsion_note, results.torsion.status, "-", results.torsion.status))
-    if inputs.has_negative_design and results.negative_bending is not None:
-        rows.append(
-            ReportRow("Negative flexure", "-", results.negative_bending.design_status, results.negative_bending.design_status, "-", results.negative_bending.as_status)
-        )
-    rows.extend(
-        [
-            ReportRow("Warnings", "-", f"{len(results.warnings)} warnings", f"{len(results.warnings)} warnings", "-", note="See workspace summary for details"),
-            ReportRow(
-                "Review flags",
-                "-",
-                f"{len(results.review_flags)} review flags",
-                f"{len(results.review_flags)} review flags",
-                "-",
-                VerificationStatus.NEEDS_REVIEW.value if results.review_flags else "None",
-            ),
-        ]
-    )
-    return ReportSection(title="Final Design Summary", rows=rows)
-
-
 def _build_spacing_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
     rows: list[ReportRow] = []
     spacing_groups = [
@@ -1689,21 +1420,6 @@ def _build_review_flag_section(results: BeamDesignResults) -> ReportSection:
     return ReportSection(title="Review Flags", rows=rows)
 
 
-def _build_full_input_summary(inputs: BeamDesignInputSet) -> ReportSection:
-    return ReportSection(
-        title="Input Summary",
-        rows=[
-            ReportRow("Design code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
-            ReportRow(_sym_fc(), "-", f"{_sym_fc()} = {format_number(inputs.materials.concrete_strength_ksc)} ksc", format_number(inputs.materials.concrete_strength_ksc), "ksc"),
-            ReportRow(_sym_fy(), "-", f"{_sym_fy()} = {format_number(inputs.materials.main_steel_yield_ksc)} ksc", format_number(inputs.materials.main_steel_yield_ksc), "ksc"),
-            ReportRow(_sym_fvy(), "-", f"{_sym_fvy()} = {format_number(inputs.materials.shear_steel_yield_ksc)} ksc", format_number(inputs.materials.shear_steel_yield_ksc), "ksc"),
-            ReportRow("b", "-", f"b = {format_number(inputs.geometry.width_cm)} cm", format_number(inputs.geometry.width_cm), "cm"),
-            ReportRow("h", "-", f"h = {format_number(inputs.geometry.depth_cm)} cm", format_number(inputs.geometry.depth_cm), "cm"),
-            ReportRow("cover", "-", f"cover = {format_number(inputs.geometry.cover_cm)} cm", format_number(inputs.geometry.cover_cm), "cm"),
-        ],
-    )
-
-
 def _build_full_material_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
     ec_substitution = (
         f"E_c = 15100 x sqrt({format_number(inputs.materials.concrete_strength_ksc)})"
@@ -1733,11 +1449,12 @@ def _build_full_material_section(inputs: BeamDesignInputSet, results: BeamDesign
 
 
 def _build_full_geometry_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    primary_section_label = _primary_section_label(inputs)
     rows = [
         ReportRow("A<sub>g</sub>", "A<sub>g</sub> = b x h", f"A<sub>g</sub> = {format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)}", format_number(results.beam_geometry.section_area_cm2), _unit_cm2()),
         ReportRow("I<sub>g</sub>", "I<sub>g</sub> = bh<sup>3</sup> / 12", f"I<sub>g</sub> = {format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)}<sup>3</sup> / 12", format_number(results.beam_geometry.gross_moment_of_inertia_cm4), "cm<sup>4</sup>"),
         ReportRow("d′", "-", "Centroid of top reinforcement from compression face", format_number(results.beam_geometry.positive_compression_centroid_d_prime_cm), "cm"),
-        ReportRow("d", "-", "Effective depth to bottom tension reinforcement", format_number(results.beam_geometry.d_plus_cm), "cm"),
+        ReportRow("d", "-", f"Effective depth to the {primary_section_label.lower()} tension reinforcement", format_number(results.beam_geometry.d_plus_cm), "cm"),
     ]
     if inputs.has_negative_design and results.beam_geometry.d_minus_cm is not None:
         rows.append(
@@ -1757,7 +1474,7 @@ def _build_full_positive_section(inputs: BeamDesignInputSet, results: BeamDesign
         ),
     )
     return ReportSection(
-        title="Positive Moment Design",
+        title="Middle Moment Design" if inputs.beam_type == BeamType.SIMPLE else "Positive Moment Design",
         rows=[
             ReportRow("Tension reinforcement", "-", _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
             ReportRow("Compression reinforcement", "-", _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
@@ -1784,29 +1501,35 @@ def _build_full_positive_section(inputs: BeamDesignInputSet, results: BeamDesign
     )
 
 
+def _build_full_support_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    return _build_support_section(inputs, results)
+
+
 def _build_full_shear_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
     shear = results.shear
     return ReportSection(
         title="Shear Design",
         rows=[
-            ReportRow(_sym_vu(), "-", f"{_sym_vu()} = {format_number(inputs.shear.factored_shear_kg)} kg", format_number(inputs.shear.factored_shear_kg), "kg"),
+            ReportRow(_sym_vu(), "-", f"{_sym_vu()} = {format_number(shear.input_factored_shear_kg)} kg", format_number(shear.input_factored_shear_kg), "kg"),
             ReportRow("&phi;", "-", f"Selected from {inputs.metadata.design_code.value}", format_ratio(shear.phi), "-", shear.design_status),
-            ReportRow(_sym_vc(), f"{_sym_vc()} = 0.53&radic;{_sym_fc()}bd", f"{_sym_vc()} = 0.53 &times; &radic;{format_number(inputs.materials.concrete_strength_ksc)} &times; {format_number(inputs.geometry.width_cm)} &times; {format_number(results.beam_geometry.d_plus_cm)}", format_number(shear.vc_kg), "kg"),
+            ReportRow("Section basis", "-", _shear_basis_text(results), shear.design_section_label, "-", shear.design_status, shear.section_change_note),
+            ReportRow("d<sub>shear</sub>", "-", f"d from {_shear_basis_text(results)} = {_shear_effective_depth_text(results)} cm", _shear_effective_depth_text(results), "cm"),
+            ReportRow(_sym_vc(), f"{_sym_vc()} = 0.53&radic;{_sym_fc()}bd", f"{_sym_vc()} = 0.53 &times; &radic;{format_number(inputs.materials.concrete_strength_ksc)} &times; {format_number(inputs.geometry.width_cm)} &times; {_shear_effective_depth_text(results)}", format_number(shear.vc_kg), "kg"),
             ReportRow(_sym_phi_vc(), f"{_sym_phi_vc()} = &phi;{_sym_vc()}", f"{_sym_phi_vc()} = {format_ratio(shear.phi, 3)} &times; {format_number(shear.vc_kg)}", format_number(shear.phi_vc_kg), "kg"),
-            ReportRow("V<sub>s,max</sub>", f"V<sub>s,max</sub> = 2.1&radic;{_sym_fc()}bd", f"V<sub>s,max</sub> = 2.1 &times; &radic;{format_number(inputs.materials.concrete_strength_ksc)} &times; {format_number(inputs.geometry.width_cm)} &times; {format_number(results.beam_geometry.d_plus_cm)}", format_number(shear.vs_max_kg), "kg"),
+            ReportRow("V<sub>s,max</sub>", f"V<sub>s,max</sub> = 2.1&radic;{_sym_fc()}bd", f"V<sub>s,max</sub> = 2.1 &times; &radic;{format_number(inputs.materials.concrete_strength_ksc)} &times; {format_number(inputs.geometry.width_cm)} &times; {_shear_effective_depth_text(results)}", format_number(shear.vs_max_kg), "kg"),
             ReportRow("&phi;V<sub>s,max</sub>", "&phi;V<sub>s,max</sub> = &phi; &times; V<sub>s,max</sub>", f"&phi;V<sub>s,max</sub> = {format_ratio(shear.phi, 3)} &times; {format_number(shear.vs_max_kg)}", format_number(shear.phi_vs_max_kg), "kg"),
-            ReportRow("&phi;V<sub>s,req</sub>", f"&phi;V<sub>s,req</sub> = {_sym_vu()} - {_sym_phi_vc()}", f"&phi;V<sub>s,req</sub> = {format_number(inputs.shear.factored_shear_kg)} - {format_number(shear.phi_vc_kg)}", format_number(shear.phi_vs_required_kg), "kg"),
+            ReportRow("&phi;V<sub>s,req</sub>", f"&phi;V<sub>s,req</sub> = {_sym_vu()} - {_sym_phi_vc()}", f"&phi;V<sub>s,req</sub> = {format_number(shear.input_factored_shear_kg)} - {format_number(shear.phi_vc_kg)}", format_number(shear.phi_vs_required_kg), "kg"),
             ReportRow("V<sub>s,req</sub>", "V<sub>s,req</sub> = &phi;V<sub>s,req</sub> / &phi;", f"V<sub>s,req</sub> = {format_number(shear.phi_vs_required_kg)} / {format_ratio(shear.phi, 3)}", format_number(shear.nominal_vs_required_kg), "kg"),
             ReportRow(_sym_av(), f"{_sym_av()} = &pi;d<sub>b</sub><sup>2</sup> / 4 &times; number of legs", f"{_sym_av()} = &pi; &times; {format_number(inputs.shear.stirrup_diameter_mm / 10)}<sup>2</sup> / 4 &times; {inputs.shear.legs_per_plane}", format_number(shear.av_cm2), _unit_cm2()),
             ReportRow("s_max,1", "-", "Limit from transverse reinforcement proportioning", format_number(shear.s_max_from_av_cm), "cm"),
             ReportRow("s_max,2", "-", "Limit from shear demand branch", format_number(shear.s_max_from_vs_cm), "cm"),
             ReportRow("s<sub>req</sub>", "s<sub>req</sub> = min(strength limit, spacing limits)", "Use the smallest permitted spacing", format_number(shear.required_spacing_cm), "cm"),
             ReportRow("s<sub>prov</sub>", "-", f"{shear.spacing_mode.value} spacing used in design", format_number(shear.provided_spacing_cm), "cm", shear.design_status),
-            ReportRow(_sym_vs(), f"{_sym_vs()} = {_sym_av()}{_sym_fvy()}d / s<sub>prov</sub>", f"{_sym_vs()} = {format_number(shear.av_cm2)} &times; {format_number(inputs.materials.shear_steel_yield_ksc)} &times; {format_number(results.beam_geometry.d_plus_cm)} / {format_number(shear.provided_spacing_cm)}", format_number(shear.vs_provided_kg), "kg"),
+            ReportRow(_sym_vs(), f"{_sym_vs()} = {_sym_av()}{_sym_fvy()}d / s<sub>prov</sub>", f"{_sym_vs()} = {format_number(shear.av_cm2)} &times; {format_number(inputs.materials.shear_steel_yield_ksc)} &times; {_shear_effective_depth_text(results)} / {format_number(shear.provided_spacing_cm)}", format_number(shear.vs_provided_kg), "kg"),
             ReportRow(_sym_phi_vs(), f"{_sym_phi_vs()} = &phi;{_sym_vs()}", f"{_sym_phi_vs()} = {format_ratio(shear.phi, 3)} &times; {format_number(shear.vs_provided_kg)}", format_number(shear.phi_vs_provided_kg), "kg"),
             ReportRow(_sym_vn(), f"{_sym_vn()} = {_sym_vc()} + min({_sym_vs()}, V<sub>s,max</sub>)", f"{_sym_vn()} = {format_number(shear.vc_kg)} + min({format_number(shear.vs_provided_kg)}, {format_number(shear.vs_max_kg)})", format_number(shear.vn_kg), "kg"),
             ReportRow(_sym_phi_vn(), f"{_sym_phi_vn()} = &phi;{_sym_vn()}", f"{_sym_phi_vn()} = {format_ratio(shear.phi, 3)} &times; {format_number(shear.vn_kg)}", format_number(shear.phi_vn_kg), "kg"),
-            ReportRow(f"{_sym_vu()} / {_sym_phi_vn()}", "-", f"{format_number(inputs.shear.factored_shear_kg)} / {format_number(shear.phi_vn_kg)}", format_ratio(shear.capacity_ratio), "-", shear.design_status, shear.review_note),
+            ReportRow(f"{_sym_vu()} / {_sym_phi_vn()}", "-", f"{format_number(shear.input_factored_shear_kg)} / {format_number(shear.phi_vn_kg)}", format_ratio(shear.capacity_ratio), "-", shear.design_status, shear.review_note),
         ],
     )
 
@@ -2104,82 +1827,6 @@ def _member_summary_text(inputs: BeamDesignInputSet, results: BeamDesignResults)
     )
 
 
-def _member_fact_lines(inputs: BeamDesignInputSet) -> list[str]:
-    facts = [
-        f"Beam type: {inputs.beam_type.value}",
-        f"Code: {inputs.metadata.design_code.value}",
-        f"Section: {format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)} cm, cover {format_number(inputs.geometry.cover_cm)} cm",
-        f"Materials: f'c {format_number(inputs.materials.concrete_strength_ksc)} ksc, fy {format_number(inputs.materials.main_steel_yield_ksc)} ksc, fvy {format_number(inputs.materials.shear_steel_yield_ksc)} ksc",
-    ]
-    if inputs.torsion.enabled:
-        facts.append(f"Torsion demand type: {inputs.torsion.demand_type.value}")
-    if inputs.consider_deflection:
-        facts.append(f"Deflection check: {inputs.deflection.member_type.value}, {inputs.deflection.support_condition.value}")
-    return facts
-
-
-def _design_actions_text(inputs: BeamDesignInputSet, results: BeamDesignResults) -> str:
-    action_parts = [
-        f"The governing positive factored moment used in design is {format_number(inputs.positive_bending.factored_moment_kgm)} kgf-m",
-        f"and the governing factored shear is {format_number(inputs.shear.factored_shear_kg)} kgf.",
-    ]
-    if inputs.has_negative_design and results.negative_bending is not None:
-        action_parts.append(
-            f"The support region is checked for a negative moment of {format_number(inputs.negative_bending.factored_moment_kgm)} kgf-m."
-        )
-    if inputs.torsion.enabled:
-        if results.combined_shear_torsion.torsion_ignored:
-            action_parts.append(
-                f"The entered torsion, {format_number(inputs.torsion.factored_torsion_kgfm)} kgf-m, falls below the code threshold and is not required to govern reinforcement design."
-            )
-        else:
-            action_parts.append(
-                f"Torsion has been considered using Tu = {format_number(inputs.torsion.factored_torsion_kgfm)} kgf-m."
-            )
-    if inputs.consider_deflection:
-        action_parts.append(
-            f"Serviceability is checked against an allowable deflection of {format_number(results.deflection.allowable_deflection_cm)} cm."
-        )
-    return " ".join(action_parts)
-
-
-def _build_flexure_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> NarrativeSection:
-    positive_text = (
-        f"At the positive-moment section, the factored moment is {format_number(inputs.positive_bending.factored_moment_kgm)} kgf-m "
-        f"and the available design flexural strength is {format_number(results.positive_bending.phi_mn_kgm)} kgf-m, "
-        f"giving a utilization ratio of {format_ratio(results.positive_bending.ratio)}. "
-        f"Positive flexural design is {_acceptability_phrase(results.positive_bending.design_status)}. "
-        f"{_beam_behavior_sentence(results.positive_bending)}"
-    )
-    bullets: list[str] = []
-    if inputs.has_negative_design and results.negative_bending is not None:
-        bullets.append(
-            f"Support section: Mu = {format_number(inputs.negative_bending.factored_moment_kgm)} kgf-m, "
-            f"phiMn = {format_number(results.negative_bending.phi_mn_kgm)} kgf-m, ratio = {format_ratio(results.negative_bending.ratio)}."
-        )
-        bullets.append(_beam_behavior_sentence(results.negative_bending, prefix="Support section"))
-    return NarrativeSection(title="Flexure", body=positive_text, bullets=tuple(bullets))
-
-
-def _build_shear_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> NarrativeSection:
-    stirrup_spacing_cm = (
-        results.combined_shear_torsion.stirrup_spacing_cm
-        if results.combined_shear_torsion.active
-        else results.shear.provided_spacing_cm
-    )
-    body = (
-        f"Shear design is {_acceptability_phrase(results.shear.design_status)}. The factored shear is "
-        f"{format_number(inputs.shear.factored_shear_kg)} kgf, compared with a design shear strength of "
-        f"{format_number(results.shear.phi_vn_kg)} kgf, giving a utilization ratio of {format_ratio(results.shear.capacity_ratio)}. "
-        f"The provided closed stirrups are {stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm} "
-        f"with {inputs.shear.legs_per_plane} legs at {format_number(stirrup_spacing_cm)} cm."
-    )
-    bullets: list[str] = []
-    if results.shear.review_note:
-        bullets.append(results.shear.review_note)
-    return NarrativeSection(title="Shear", body=body, bullets=tuple(bullets))
-
-
 def _build_torsion_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> NarrativeSection | None:
     if not inputs.torsion.enabled:
         return None
@@ -2219,32 +1866,6 @@ def _build_deflection_summary_narrative(results: BeamDesignResults) -> Narrative
     if results.deflection.pass_fail_summary:
         bullets.append(results.deflection.pass_fail_summary)
     return NarrativeSection(title="Deflection", body=body, bullets=tuple(bullets))
-
-
-def _reinforcement_summary_lines(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[str]:
-    lines = [
-        f"Provide bottom flexural reinforcement at the positive section as {_format_arrangement_for_note(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc)}.",
-    ]
-    if inputs.has_negative_design and results.negative_bending is not None:
-        lines.append(
-            f"Provide top flexural reinforcement at the negative section as {_format_arrangement_for_note(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc)}."
-        )
-    stirrup_spacing_cm = (
-        results.combined_shear_torsion.stirrup_spacing_cm
-        if results.combined_shear_torsion.active
-        else results.shear.provided_spacing_cm
-    )
-    lines.append(
-        f"Provide closed {stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm} stirrups with "
-        f"{inputs.shear.legs_per_plane} legs at {format_number(stirrup_spacing_cm)} cm."
-    )
-    if inputs.torsion.enabled and not results.combined_shear_torsion.torsion_ignored and inputs.torsion.provided_longitudinal_bar_diameter_mm is not None:
-        lines.append(
-            f"Provide torsion longitudinal steel as {inputs.torsion.provided_longitudinal_bar_count}-"
-            f"{longitudinal_bar_mark(inputs.torsion.provided_longitudinal_bar_fy_ksc)}"
-            f"{inputs.torsion.provided_longitudinal_bar_diameter_mm}."
-        )
-    return lines
 
 
 def _governing_note_lines(results: BeamDesignResults) -> list[str]:
@@ -2323,86 +1944,6 @@ def _material_note(mode: str, default_logic: str) -> str:
     return f"Original app logic: {default_logic}"
 
 
-def _print_input_mu_value(inputs: BeamDesignInputSet) -> str:
-    positive_text = format_number(inputs.positive_bending.factored_moment_kgm)
-    if not inputs.has_negative_design:
-        return positive_text
-    return f"(+) {positive_text} | (-) {format_number(inputs.negative_bending.factored_moment_kgm)}"
-
-
-def _build_print_design_summary(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
-    combined = results.combined_shear_torsion
-    rows = [
-        ReportRow(
-            "Overall Status",
-            "-",
-            f"W {len(results.warnings)} | R {len(results.review_flags)}",
-            results.overall_status,
-            "-",
-            note=_summary_label(results.overall_note),
-        ),
-        ReportRow(
-            "Positive Flexure",
-            "-",
-            f"ratio {format_ratio(results.positive_bending.ratio)}",
-            results.positive_bending.design_status,
-            "-",
-            status=_summary_label(results.positive_bending.as_status),
-            note=_summary_label(_beam_behavior_report_text(results.positive_bending)),
-        ),
-    ]
-    if combined.active:
-        rows.append(
-            ReportRow(
-                "Shear & Torsion",
-                "-",
-                f"ratio {format_ratio(combined.capacity_ratio)}",
-                combined.design_status,
-                "-",
-                status=f"{stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{combined.stirrup_diameter_mm} @ {format_number(combined.stirrup_spacing_cm)} cm",
-                note=_summary_label(combined.design_status_note or combined.summary_note),
-            )
-        )
-    else:
-        rows.append(
-            ReportRow(
-                "Shear",
-                "-",
-                f"ratio {format_ratio(results.shear.capacity_ratio)}",
-                results.shear.design_status,
-                "-",
-                status=f"{stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm} @ {format_number(results.shear.provided_spacing_cm)} cm",
-                note=_summary_label(_print_shear_summary_note(results)),
-            )
-        )
-    if inputs.has_negative_design and results.negative_bending is not None:
-        rows.insert(
-            2,
-            ReportRow(
-                "Negative Flexure",
-                "-",
-                f"ratio {format_ratio(results.negative_bending.ratio)}",
-                results.negative_bending.design_status,
-                "-",
-                status=_summary_label(results.negative_bending.as_status),
-                note=_summary_label(_beam_behavior_report_text(results.negative_bending)),
-            ),
-        )
-    if inputs.consider_deflection:
-        rows.append(
-            ReportRow(
-                "Deflection",
-                "-",
-                f"ratio {format_ratio(results.deflection.capacity_ratio)}",
-                results.deflection.status,
-                "-",
-                status=f"allow {format_number(results.deflection.allowable_deflection_cm)} cm",
-                note=_summary_label(results.deflection.pass_fail_summary or results.deflection.note),
-            )
-        )
-    return ReportSection(title="Design Summary", rows=rows)
-
-
 def _beam_behavior_mode_summary(inputs: BeamDesignInputSet) -> str:
     return (
         f"{inputs.beam_behavior_mode.value} | "
@@ -2413,7 +1954,7 @@ def _beam_behavior_mode_summary(inputs: BeamDesignInputSet) -> str:
 def _beam_behavior_report_text(results) -> str:
     mode_text = f"Mode {results.beam_behavior_mode}"
     if results.beam_behavior_mode == "Auto":
-        classification_text = f"Auto Result {results.auto_result or results.effective_beam_behavior}"
+        classification_text = f"Auto heuristic result {results.auto_result or results.effective_beam_behavior}"
     else:
         classification_text = f"Effective {results.effective_beam_behavior}"
     ratio_text = f"R {format_number(results.behavior_contribution_ratio_r * 100.0)}%"
@@ -2434,7 +1975,7 @@ def _beam_behavior_sentence(results, *, prefix: str = "Beam behavior") -> str:
     )
     if results.beam_behavior_mode == "Auto":
         return (
-            f"{prefix} is set to Auto and classifies this section as "
+            f"{prefix} is set to Auto and the app heuristic classifies this section as "
             f"{results.auto_result or results.effective_beam_behavior}, based on "
             f"R = {format_number(results.behavior_contribution_ratio_r * 100.0)}% "
             f"against a threshold of {format_number(results.behavior_threshold_r * 100.0)}%. "
@@ -2553,7 +2094,7 @@ def _print_shear_summary_note(results: BeamDesignResults) -> str:
         return shear.review_note
     if shear.design_status != "PASS":
         return "Check stirrup spacing, Av, and section size against the required shear branch."
-    return "Capacity ratio <= 1.00 is acceptable in this summary view."
+    return f"Based on {_shear_basis_text(results)} with d = {_shear_effective_depth_text(results)} cm."
 
 
 def _sym_b() -> str:
@@ -2668,13 +2209,520 @@ def _format_default_ec_logic() -> str:
     return f"{_sym_ec()} = 15100&radic;{_sym_fc()}"
 
 
-def _format_default_es_logic() -> str:
-    return f"{_sym_es()} = 2.04 × 10<sup>6</sup>"
-
-
 def _format_default_fr_logic() -> str:
     return f"{_sym_fr()} = 2&radic;{_sym_fc()}"
 
 
 def _format_default_es_logic() -> str:
     return f"{_sym_es()} = 2.04 &times; 10<sup>6</sup>"
+
+
+def _active_flexural_report_specs(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = []
+    if inputs.has_positive_design:
+        specs.append(
+            {
+                "key": "middle" if inputs.beam_type == BeamType.SIMPLE else "positive",
+                "label": "Middle" if inputs.beam_type == BeamType.SIMPLE else "Positive",
+                "title": "Middle Moment Design" if inputs.beam_type == BeamType.SIMPLE else "Positive Moment Design",
+                "moment": inputs.positive_bending.factored_moment_kgm,
+                "input": inputs.positive_bending,
+                "result": results.positive_bending,
+            }
+        )
+    if inputs.has_simple_support_design and results.support_bending is not None:
+        specs.append(
+            {
+                "key": "support",
+                "label": "Support",
+                "title": "Support Moment Design",
+                "moment": inputs.resolved_simple_support_moment_kgm,
+                "input": inputs.simple_support_bending,
+                "result": results.support_bending,
+            }
+        )
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        specs.append(
+            {
+                "key": "negative",
+                "label": "Negative",
+                "title": "Negative Moment Design",
+                "moment": inputs.negative_bending.factored_moment_kgm,
+                "input": inputs.negative_bending,
+                "result": results.negative_bending,
+            }
+        )
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        specs.append(
+            {
+                "key": "cantilever_negative",
+                "label": "Cantilever Negative",
+                "title": "Cantilever Negative Moment Design",
+                "moment": inputs.cantilever_negative_bending.factored_moment_kgm,
+                "input": inputs.cantilever_negative_bending,
+                "result": results.cantilever_negative_bending,
+            }
+        )
+    return specs
+
+
+def _build_cantilever_negative_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    cantilever = results.cantilever_negative_bending
+    if cantilever is None:
+        raise ValueError("Cantilever negative report section requested without cantilever results.")
+    d_minus_text = _negative_section_effective_depth_text(inputs, inputs.cantilever_negative_bending)
+    mn_equation, mn_substitution = _moment_capacity_row_content(
+        cantilever,
+        default_equation="As * fy * (d- - a/2) / 100",
+        default_substitution=(
+            f"{format_number(cantilever.as_provided_cm2)} * {format_number(inputs.materials.main_steel_yield_ksc)} "
+            f"* ({d_minus_text} - {format_number(cantilever.a_cm)}/2) / 100"
+        ),
+    )
+    return ReportSection(
+        title="Cantilever Negative Moment Design",
+        rows=[
+            ReportRow("Tension Reinforcement", "Top bars", _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Top bars"),
+            ReportRow("Compression Reinforcement", "Bottom bars", _format_arrangement(inputs.cantilever_negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Bottom bars"),
+            ReportRow("phi", "Current / ACI-style phi logic", f"et = {cantilever.et:.6f}", format_ratio(cantilever.phi), "-", cantilever.ratio_status),
+            ReportRow("Ru", "Mu * 100 / (phi * b * d^2)", f"{format_number(inputs.cantilever_negative_bending.factored_moment_kgm)} * 100 / ({format_ratio(cantilever.phi, 3)} * {format_number(inputs.geometry.width_cm)} * {d_minus_text}^2)", format_number(cantilever.ru_kg_per_cm2), "kg/cm2"),
+            ReportRow("rho required", "Current flexural demand equation", f"Ru = {format_number(cantilever.ru_kg_per_cm2)}", format_ratio(cantilever.rho_required, 6), "-"),
+            ReportRow("rho provided", "As / (b*d-)", f"{format_number(cantilever.as_provided_cm2)} / ({format_number(inputs.geometry.width_cm)} * {d_minus_text})", format_ratio(cantilever.rho_provided, 6), "-", cantilever.as_status),
+            ReportRow("As required", "rho_req * b * d-", f"{cantilever.rho_required:.6f} * {inputs.geometry.width_cm:.2f} * {d_minus_text}", format_number(cantilever.as_required_cm2), "cm2"),
+            ReportRow("As provided", "sum(bar areas)", _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), format_number(cantilever.as_provided_cm2), "cm2", cantilever.as_status),
+            ReportRow("As min", "rho_min * b * d-", f"{cantilever.rho_min:.6f} * {inputs.geometry.width_cm:.2f} * {d_minus_text}", format_number(cantilever.as_min_cm2), "cm2"),
+            ReportRow("As max", "rho_max * b * d-", f"{cantilever.rho_max:.6f} * {inputs.geometry.width_cm:.2f} * {d_minus_text}", format_number(cantilever.as_max_cm2), "cm2"),
+            ReportRow("a", "As * fy / (0.85 * fc' * b)", "Cantilever negative bending", format_number(cantilever.a_cm), "cm"),
+            ReportRow("c", "a / beta1", "Cantilever negative bending", format_number(cantilever.c_cm), "cm"),
+            ReportRow("et", "ecu * (dt - c) / c", f"0.003 * ({format_number(cantilever.dt_cm)} - {format_number(cantilever.c_cm)}) / {format_number(cantilever.c_cm)}", format_ratio(cantilever.et, 6), "-"),
+            ReportRow("Mn", mn_equation, mn_substitution, format_number(cantilever.mn_kgm), "kg-m"),
+            ReportRow("phiMn", "phi * Mn", f"{cantilever.phi:.3f} * {cantilever.mn_kgm:.2f}", format_number(cantilever.phi_mn_kgm), "kg-m", cantilever.ratio_status),
+        ],
+    )
+
+
+def _build_full_cantilever_negative_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    cantilever = results.cantilever_negative_bending
+    if cantilever is None:
+        raise ValueError("Cantilever negative full report section requested without cantilever results.")
+    d_minus_text = _negative_section_effective_depth_text(inputs, inputs.cantilever_negative_bending)
+    mn_equation, mn_substitution = _moment_capacity_row_content(
+        cantilever,
+        default_equation="M<sub>n,cant</sub> = A<sub>s</sub>f<sub>y</sub>(d<sub>cant</sub> - a/2) / 100",
+        default_substitution=(
+            f"M<sub>n,cant</sub> = {format_number(cantilever.as_provided_cm2)} &times; {format_number(inputs.materials.main_steel_yield_ksc)} "
+            f"&times; ({d_minus_text} - {format_number(cantilever.a_cm)}/2) / 100"
+        ),
+    )
+    return ReportSection(
+        title="Cantilever Negative Moment Design",
+        rows=[
+            ReportRow("Tension reinforcement", "-", _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
+            ReportRow("Compression reinforcement", "-", _format_arrangement(inputs.cantilever_negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
+            ReportRow("M<sub>u,cant</sub>", "-", f"M<sub>u,cant</sub> = {format_number(inputs.cantilever_negative_bending.factored_moment_kgm)} kg-m", format_number(inputs.cantilever_negative_bending.factored_moment_kgm), "kg-m"),
+            ReportRow("&phi;", "-", f"From tensile strain, &epsilon;<sub>t</sub> = {format_ratio(cantilever.et, 6)}", format_ratio(cantilever.phi), "-", cantilever.ratio_status),
+            ReportRow("R<sub>u,cant</sub>", "R<sub>u,cant</sub> = M<sub>u,cant</sub> &times; 100 / (&phi;bd<sub>cant</sub><sup>2</sup>)", f"R<sub>u,cant</sub> = {format_number(inputs.cantilever_negative_bending.factored_moment_kgm)} &times; 100 / ({format_ratio(cantilever.phi, 3)} &times; {format_number(inputs.geometry.width_cm)} &times; {d_minus_text}<sup>2</sup>)", format_number(cantilever.ru_kg_per_cm2), "kg/cm<sup>2</sup>"),
+            ReportRow(_sym_as_req(), f"{_sym_as_req()} = {_sym_rho_req()}bd<sub>cant</sub>", f"{_sym_as_req()} = {format_ratio(cantilever.rho_required, 6)} &times; {format_number(inputs.geometry.width_cm)} &times; {d_minus_text}", format_number(cantilever.as_required_cm2), _unit_cm2()),
+            ReportRow(_sym_as_prov(), "-", _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), format_number(cantilever.as_provided_cm2), _unit_cm2(), cantilever.as_status),
+            ReportRow("&epsilon;<sub>t,cant</sub>", "&epsilon;<sub>t,cant</sub> = 0.003(d<sub>t</sub> - c) / c", f"&epsilon;<sub>t,cant</sub> = 0.003({format_number(cantilever.dt_cm)} - {format_number(cantilever.c_cm)}) / {format_number(cantilever.c_cm)}", format_ratio(cantilever.et, 6), "-"),
+            ReportRow("M<sub>n,cant</sub>", mn_equation, mn_substitution, format_number(cantilever.mn_kgm), "kg-m"),
+            ReportRow("&phi;M<sub>n,cant</sub>", "&phi;M<sub>n,cant</sub> = &phi; &times; M<sub>n,cant</sub>", f"&phi;M<sub>n,cant</sub> = {format_ratio(cantilever.phi, 3)} &times; {format_number(cantilever.mn_kgm)}", format_number(cantilever.phi_mn_kgm), "kg-m", cantilever.ratio_status),
+            ReportRow("M<sub>u,cant</sub> / &phi;M<sub>n,cant</sub>", "-", f"{format_number(inputs.cantilever_negative_bending.factored_moment_kgm)} / {format_number(cantilever.phi_mn_kgm)}", format_ratio(cantilever.ratio), "-", cantilever.design_status),
+        ],
+    )
+
+
+def build_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
+    sections = [_build_input_summary(inputs), _build_material_section(inputs, results), _build_geometry_section(inputs, results)]
+    if inputs.has_positive_design:
+        sections.append(_with_updated_moment_summary_row(_build_positive_section(inputs, results), results.positive_bending))
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        sections.append(_with_updated_moment_summary_row(_build_negative_section(inputs, results), results.negative_bending))
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        sections.append(_with_updated_moment_summary_row(_build_cantilever_negative_section(inputs, results), results.cantilever_negative_bending))
+    sections.append(_build_shear_section(inputs, results))
+    if inputs.torsion.enabled:
+        sections.append(_build_torsion_section(inputs, results))
+    if inputs.consider_deflection:
+        sections.append(_build_deflection_section(results))
+    sections.append(_build_summary_section(inputs, results))
+    return sections
+
+
+def build_summary_table_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
+    rows = [
+        ReportRow("Beam Type", "-", inputs.beam_type.value, inputs.beam_type.value, "-"),
+        ReportRow("Beam Behavior", "-", inputs.beam_behavior_mode.value, inputs.beam_behavior_mode.value, "-"),
+    ]
+    cantilever_value = _cantilever_span_summary(inputs)
+    if cantilever_value is not None:
+        rows.append(ReportRow("Include Cantilever Span", "-", cantilever_value, cantilever_value, "-"))
+    rows.extend(
+        [
+            ReportRow("Sections", "-", _active_section_names(inputs), _active_section_names(inputs), "-"),
+            ReportRow("Code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
+            ReportRow("Section", "-", f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)} cm, c={format_number(inputs.geometry.cover_cm)} cm", f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)}", "cm"),
+            ReportRow("Vu", "-", format_number(inputs.shear.factored_shear_kg), format_number(inputs.shear.factored_shear_kg), "kgf"),
+        ]
+    )
+    for spec in _active_flexural_report_specs(inputs, results):
+        moment_label = "Mu(+)" if spec["key"] == "positive" else ("Mu(-)" if spec["key"] == "negative" else "Mu(cant-)")
+        rows.append(ReportRow(moment_label, "-", format_number(spec["moment"]), format_number(spec["moment"]), "kgf-m"))
+    sections = [
+        ReportSection(title="Member Summary", rows=rows),
+        _build_summary_table_flexure_section(inputs, results),
+        _build_summary_table_shear_section(inputs, results),
+        _build_summary_reinforcement_section(inputs, results),
+        _build_print_design_summary(inputs, results),
+    ]
+    if inputs.torsion.enabled:
+        sections[0].rows.append(ReportRow("Tu", "-", format_number(inputs.torsion.factored_torsion_kgfm), format_number(inputs.torsion.factored_torsion_kgfm), "kgf-m"))
+        sections.insert(3, _build_summary_table_torsion_section(results))
+    if inputs.consider_deflection and results.deflection.status != "Not considered":
+        sections.insert(-2, _build_summary_table_deflection_section(results))
+    return sections
+
+
+def build_full_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
+    sections = [_build_full_input_summary(inputs), _build_full_material_section(inputs, results), _build_full_geometry_section(inputs, results)]
+    if inputs.has_simple_support_design and results.support_bending is not None:
+        sections.append(_build_full_support_section(inputs, results))
+    if inputs.has_positive_design:
+        sections.append(_build_full_positive_section(inputs, results))
+    sections.extend([_build_full_spacing_section(inputs, results), _build_full_shear_section(inputs, results)])
+    if inputs.torsion.enabled:
+        sections.append(_build_full_torsion_section(results))
+    if inputs.consider_deflection:
+        sections.append(_build_full_deflection_section(results))
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        sections.append(_build_full_negative_section(inputs, results))
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        sections.append(_build_full_cantilever_negative_section(inputs, results))
+    if results.warnings:
+        sections.append(_build_full_warning_section(results))
+    if results.review_flags:
+        sections.append(_build_full_review_flag_section(results))
+    return sections
+
+
+def _build_summary_table_flexure_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    rows: list[ReportRow] = []
+    for spec in _active_flexural_report_specs(inputs, results):
+        result = spec["result"]
+        label = spec["label"]
+        rows.append(
+            ReportRow(
+                f"{label} Flexure",
+                "-",
+                f"M<sub>u</sub> {format_number(spec['moment'])} | &phi;M<sub>n</sub> {format_number(result.phi_mn_kgm)} | {_beam_behavior_report_text(result)}",
+                format_ratio(result.ratio),
+                "-",
+                result.design_status,
+                _summary_label(result.as_status),
+            )
+        )
+        rows.append(
+            ReportRow(
+                f"{label} Behavior",
+                "-",
+                _beam_behavior_report_text(result),
+                result.effective_beam_behavior,
+                "-",
+                result.design_status,
+            )
+        )
+    rows.append(
+        ReportRow(
+            "Primary d",
+            "-",
+            f"{_primary_section_label(inputs)} section effective depth",
+            format_number(results.beam_geometry.d_plus_cm),
+            "cm",
+        )
+    )
+    if inputs.has_support_negative_design and results.beam_geometry.d_minus_cm is not None:
+        rows.append(ReportRow("d-", "-", "Support negative section effective depth", format_number(results.beam_geometry.d_minus_cm), "cm"))
+    return ReportSection(title="Flexure", rows=rows)
+
+
+def _build_summary_reinforcement_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    rows: list[ReportRow] = []
+    if inputs.has_positive_design:
+        rows.extend(
+            [
+                ReportRow("Positive Bottom Steel", "-", _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
+                ReportRow("Positive Top Steel", "-", _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-"),
+            ]
+        )
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        rows.append(ReportRow("Negative Top Steel", "-", _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"))
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        rows.append(ReportRow("Cantilever Top Steel", "-", _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"))
+    rows.append(
+        ReportRow(
+            "Stirrups",
+            "-",
+            f"{stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm}, {inputs.shear.legs_per_plane}-leg @ {format_number(results.combined_shear_torsion.stirrup_spacing_cm if results.combined_shear_torsion.active else results.shear.provided_spacing_cm)} cm",
+            f"{format_number(results.combined_shear_torsion.stirrup_spacing_cm if results.combined_shear_torsion.active else results.shear.provided_spacing_cm)}",
+            "cm",
+        )
+    )
+    if inputs.torsion.enabled and not results.combined_shear_torsion.torsion_ignored and inputs.torsion.provided_longitudinal_bar_diameter_mm is not None:
+        rows.append(ReportRow("Torsion Long. Steel", "-", f"{inputs.torsion.provided_longitudinal_bar_count}-{longitudinal_bar_mark(inputs.torsion.provided_longitudinal_bar_fy_ksc)}{inputs.torsion.provided_longitudinal_bar_diameter_mm}", f"{inputs.torsion.provided_longitudinal_bar_count}-{longitudinal_bar_mark(inputs.torsion.provided_longitudinal_bar_fy_ksc)}{inputs.torsion.provided_longitudinal_bar_diameter_mm}", "-"))
+    return ReportSection(title="Reinforcement Summary", rows=rows)
+
+
+def _member_fact_lines(inputs: BeamDesignInputSet) -> list[str]:
+    facts = [
+        f"Beam type: {inputs.beam_type.value}",
+        f"Code: {inputs.metadata.design_code.value}",
+        f"Section: {format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)} cm, cover {format_number(inputs.geometry.cover_cm)} cm",
+        f"Materials: f'c {format_number(inputs.materials.concrete_strength_ksc)} ksc, fy {format_number(inputs.materials.main_steel_yield_ksc)} ksc, fvy {format_number(inputs.materials.shear_steel_yield_ksc)} ksc",
+        f"Active sections: {_active_section_names(inputs)}",
+    ]
+    cantilever_value = _cantilever_span_summary(inputs)
+    if cantilever_value is not None:
+        facts.append(f"Include cantilever span: {cantilever_value}")
+    if inputs.torsion.enabled:
+        facts.append(f"Torsion demand type: {inputs.torsion.demand_type.value}")
+    if inputs.consider_deflection:
+        facts.append(f"Deflection check: {inputs.deflection.member_type.value}, {inputs.deflection.support_condition.value}")
+    return facts
+
+
+def _design_actions_text(inputs: BeamDesignInputSet, results: BeamDesignResults) -> str:
+    action_parts = [f"The governing factored shear is {format_number(inputs.shear.factored_shear_kg)} kgf."]
+    for spec in _active_flexural_report_specs(inputs, results):
+        action_parts.insert(
+            len(action_parts) - 0,
+            f"The {str(spec['label']).lower()} section is checked for Mu = {format_number(spec['moment'])} kgf-m."
+        )
+    action_parts.append(
+        f"Shear strength is based on the {_shear_basis_text(results)} with d = {_shear_effective_depth_text(results)} cm."
+    )
+    if inputs.torsion.enabled:
+        if results.combined_shear_torsion.torsion_ignored:
+            action_parts.append(f"The entered torsion, {format_number(inputs.torsion.factored_torsion_kgfm)} kgf-m, falls below the code threshold and is not required to govern reinforcement design.")
+        else:
+            action_parts.append(f"Torsion has been considered using Tu = {format_number(inputs.torsion.factored_torsion_kgfm)} kgf-m.")
+    if inputs.consider_deflection:
+        action_parts.append(f"Serviceability is checked against an allowable deflection of {format_number(results.deflection.allowable_deflection_cm)} cm.")
+    return " ".join(action_parts)
+
+
+def _build_flexure_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> NarrativeSection:
+    specs = _active_flexural_report_specs(inputs, results)
+    first = specs[0]
+    first_result = first["result"]
+    first_label = "support" if first["key"] == "negative" else str(first["label"]).lower()
+    body = (
+        f"At the {first_label} section, the factored moment is {format_number(first['moment'])} kgf-m "
+        f"and the available design flexural strength is {format_number(first_result.phi_mn_kgm)} kgf-m, "
+        f"giving a utilization ratio of {format_ratio(first_result.ratio)}. "
+        f"{str(first['label'])} flexural design is {_acceptability_phrase(first_result.design_status)}. "
+        f"{_beam_behavior_sentence(first_result)}"
+    )
+    bullets: list[str] = []
+    for spec in specs[1:]:
+        result = spec["result"]
+        section_prefix = "Support section" if spec["key"] == "negative" else f"{spec['label']} section"
+        bullets.append(
+            f"{section_prefix}: Mu = {format_number(spec['moment'])} kgf-m, phiMn = {format_number(result.phi_mn_kgm)} kgf-m, ratio = {format_ratio(result.ratio)}."
+        )
+        bullets.append(_beam_behavior_sentence(result, prefix=section_prefix))
+    return NarrativeSection(title="Flexure", body=body, bullets=tuple(bullets))
+
+
+def _build_shear_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> NarrativeSection:
+    stirrup_spacing_cm = (
+        results.combined_shear_torsion.stirrup_spacing_cm
+        if results.combined_shear_torsion.active
+        else results.shear.provided_spacing_cm
+    )
+    body = (
+        f"Shear design is {_acceptability_phrase(results.shear.design_status)}. The factored shear is "
+        f"{format_number(inputs.shear.factored_shear_kg)} kgf, compared with a design shear strength of "
+        f"{format_number(results.shear.phi_vn_kg)} kgf, giving a utilization ratio of {format_ratio(results.shear.capacity_ratio)}. "
+        f"The shear check uses the {_shear_basis_text(results)} with d = {_shear_effective_depth_text(results)} cm. "
+        f"The provided closed stirrups are {stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm} "
+        f"with {inputs.shear.legs_per_plane} legs at {format_number(stirrup_spacing_cm)} cm."
+    )
+    bullets: list[str] = []
+    if results.shear.section_change_note:
+        bullets.append(results.shear.section_change_note)
+    if results.shear.review_note:
+        bullets.append(results.shear.review_note)
+    return NarrativeSection(title="Shear", body=body, bullets=tuple(bullets))
+
+
+def _reinforcement_summary_lines(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[str]:
+    lines: list[str] = []
+    if inputs.has_positive_design:
+        lines.append(f"Provide bottom flexural reinforcement at the positive section as {_format_arrangement_for_note(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc)}.")
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        lines.append(f"Provide top flexural reinforcement at the negative section as {_format_arrangement_for_note(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc)}.")
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        lines.append(f"Provide top flexural reinforcement at the cantilever negative section as {_format_arrangement_for_note(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc)}.")
+    stirrup_spacing_cm = results.combined_shear_torsion.stirrup_spacing_cm if results.combined_shear_torsion.active else results.shear.provided_spacing_cm
+    lines.append(f"Provide closed {stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm} stirrups with {inputs.shear.legs_per_plane} legs at {format_number(stirrup_spacing_cm)} cm.")
+    if inputs.torsion.enabled and not results.combined_shear_torsion.torsion_ignored and inputs.torsion.provided_longitudinal_bar_diameter_mm is not None:
+        lines.append(f"Provide torsion longitudinal steel as {inputs.torsion.provided_longitudinal_bar_count}-{longitudinal_bar_mark(inputs.torsion.provided_longitudinal_bar_fy_ksc)}{inputs.torsion.provided_longitudinal_bar_diameter_mm}.")
+    return lines
+
+
+def _print_input_mu_value(inputs: BeamDesignInputSet) -> str:
+    parts: list[str] = []
+    if inputs.has_simple_support_design:
+        support_prefix = "(support auto)" if inputs.simple_support_bending.moment_mode.value == "Auto" else "(support)"
+        parts.append(f"{support_prefix} {format_number(inputs.resolved_simple_support_moment_kgm)}")
+    if inputs.has_positive_design:
+        positive_prefix = "(middle)" if inputs.beam_type == BeamType.SIMPLE else "(+)"
+        parts.append(f"{positive_prefix} {format_number(inputs.positive_bending.factored_moment_kgm)}")
+    if inputs.has_support_negative_design:
+        parts.append(f"(-) {format_number(inputs.negative_bending.factored_moment_kgm)}")
+    if inputs.has_cantilever_negative_design:
+        parts.append(f"(cant-) {format_number(inputs.cantilever_negative_bending.factored_moment_kgm)}")
+    return " | ".join(parts)
+
+
+def _build_print_design_summary(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    combined = results.combined_shear_torsion
+    rows = [ReportRow("Overall Status", "-", f"W {len(results.warnings)} | R {len(results.review_flags)}", results.overall_status, "-", note=_summary_label(results.overall_note))]
+    for spec in _active_flexural_report_specs(inputs, results):
+        result = spec["result"]
+        rows.append(
+            ReportRow(
+                f"{spec['label']} Flexure",
+                "-",
+                f"ratio {format_ratio(result.ratio)}",
+                result.design_status,
+                "-",
+                status=_summary_label(result.as_status),
+                note=_summary_label(_beam_behavior_report_text(result)),
+            )
+        )
+    if combined.active:
+        rows.append(ReportRow("Shear & Torsion", "-", f"ratio {format_ratio(combined.capacity_ratio)}", combined.design_status, "-", status=f"{stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{combined.stirrup_diameter_mm} @ {format_number(combined.stirrup_spacing_cm)} cm", note=_summary_label(combined.design_status_note or combined.summary_note)))
+    else:
+        rows.append(ReportRow("Shear", "-", f"ratio {format_ratio(results.shear.capacity_ratio)}", results.shear.design_status, "-", status=f"{stirrup_bar_mark(inputs.materials.shear_steel_yield_ksc)}{inputs.shear.stirrup_diameter_mm} @ {format_number(results.shear.provided_spacing_cm)} cm", note=_summary_label(_print_shear_summary_note(results))))
+    rows.append(ReportRow("Shear Basis", "-", _shear_basis_text(results), _shear_effective_depth_text(results), "cm"))
+    if inputs.consider_deflection:
+        rows.append(ReportRow("Deflection", "-", f"ratio {format_ratio(results.deflection.capacity_ratio)}", results.deflection.status, "-", status=f"allow {format_number(results.deflection.allowable_deflection_cm)} cm", note=_summary_label(results.deflection.pass_fail_summary or results.deflection.note)))
+    return ReportSection(title="Design Summary", rows=rows)
+
+
+def _build_input_summary(inputs: BeamDesignInputSet) -> ReportSection:
+    rows = [
+        ReportRow("Design code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
+        ReportRow("Beam Type", "-", inputs.beam_type.value, inputs.beam_type.value, "-"),
+        ReportRow("Sections", "-", _active_section_names(inputs), _active_section_names(inputs), "-"),
+        ReportRow("Mu Mapping", "-", _mu_mapping_text(inputs), _mu_mapping_text(inputs), "-"),
+        ReportRow("Vu Mapping", "-", _vu_mapping_text(inputs), _vu_mapping_text(inputs), "-"),
+        ReportRow("fc'", "-", format_number(inputs.materials.concrete_strength_ksc), format_number(inputs.materials.concrete_strength_ksc), "ksc"),
+        ReportRow("fy", "-", format_number(inputs.materials.main_steel_yield_ksc), format_number(inputs.materials.main_steel_yield_ksc), "ksc"),
+        ReportRow("b", "-", format_number(inputs.geometry.width_cm), format_number(inputs.geometry.width_cm), "cm"),
+        ReportRow("h", "-", format_number(inputs.geometry.depth_cm), format_number(inputs.geometry.depth_cm), "cm"),
+    ]
+    cantilever_value = _cantilever_span_summary(inputs)
+    if cantilever_value is not None:
+        rows.insert(2, ReportRow("Include Cantilever Span", "-", cantilever_value, cantilever_value, "-"))
+    return ReportSection(title="Input Summary", rows=rows)
+
+
+def _build_full_input_summary(inputs: BeamDesignInputSet) -> ReportSection:
+    rows = [
+        ReportRow("Design code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
+        ReportRow("Beam type", "-", inputs.beam_type.value, inputs.beam_type.value, "-"),
+        ReportRow("Active sections", "-", _active_section_names(inputs), _active_section_names(inputs), "-"),
+        ReportRow("Mu mapping", "-", _mu_mapping_text(inputs), _mu_mapping_text(inputs), "-"),
+        ReportRow("Vu mapping", "-", _vu_mapping_text(inputs), _vu_mapping_text(inputs), "-"),
+        ReportRow(_sym_fc(), "-", f"{_sym_fc()} = {format_number(inputs.materials.concrete_strength_ksc)} ksc", format_number(inputs.materials.concrete_strength_ksc), "ksc"),
+        ReportRow(_sym_fy(), "-", f"{_sym_fy()} = {format_number(inputs.materials.main_steel_yield_ksc)} ksc", format_number(inputs.materials.main_steel_yield_ksc), "ksc"),
+        ReportRow(_sym_fvy(), "-", f"{_sym_fvy()} = {format_number(inputs.materials.shear_steel_yield_ksc)} ksc", format_number(inputs.materials.shear_steel_yield_ksc), "ksc"),
+        ReportRow("b", "-", f"b = {format_number(inputs.geometry.width_cm)} cm", format_number(inputs.geometry.width_cm), "cm"),
+        ReportRow("h", "-", f"h = {format_number(inputs.geometry.depth_cm)} cm", format_number(inputs.geometry.depth_cm), "cm"),
+        ReportRow("cover", "-", f"cover = {format_number(inputs.geometry.cover_cm)} cm", format_number(inputs.geometry.cover_cm), "cm"),
+    ]
+    cantilever_value = _cantilever_span_summary(inputs)
+    if cantilever_value is not None:
+        rows.insert(2, ReportRow("Include Cantilever Span", "-", cantilever_value, cantilever_value, "-"))
+    return ReportSection(title="Input Summary", rows=rows)
+
+
+def _build_summary_section(inputs: BeamDesignInputSet, results: BeamDesignResults) -> ReportSection:
+    combined = results.combined_shear_torsion
+    rows = [ReportRow("Overall status", "-", results.overall_note, results.overall_status, "-", results.overall_note)]
+    for spec in _active_flexural_report_specs(inputs, results):
+        result = spec["result"]
+        rows.append(ReportRow(f"{spec['label']} flexure", "-", result.design_status, result.design_status, "-", result.as_status))
+    if combined.active:
+        rows.append(ReportRow("Shear & Torsion", "-", f"Capacity Ratio (Shear + Torsion) = {format_ratio(combined.capacity_ratio)}", combined.design_status, "-", combined.design_status_note or f"\u03d5{combined.stirrup_diameter_mm} mm / {combined.stirrup_legs} legs @ {format_number(combined.stirrup_spacing_cm)} cm"))
+    else:
+        rows.append(ReportRow("Shear", "-", results.shear.design_status, results.shear.design_status, "-", f"{format_number(results.shear.provided_spacing_cm)} cm"))
+    rows.append(ReportRow("Shear basis", "-", _shear_basis_text(results), f"{_shear_effective_depth_text(results)} cm", "-", results.shear.design_status))
+    if inputs.torsion.enabled:
+        torsion_note = combined.ignore_message if combined.torsion_ignored else results.torsion.pass_fail_summary
+        rows.append(ReportRow("Torsion", "-", torsion_note, results.torsion.status, "-", results.torsion.status))
+    rows.extend(
+        [
+            ReportRow("Warnings", "-", f"{len(results.warnings)} warnings", f"{len(results.warnings)} warnings", "-", note="See workspace summary for details"),
+            ReportRow("Review flags", "-", f"{len(results.review_flags)} review flags", f"{len(results.review_flags)} review flags", "-", VerificationStatus.NEEDS_REVIEW.value if results.review_flags else "None"),
+        ]
+    )
+    return ReportSection(title="Final Design Summary", rows=rows)
+
+
+def build_print_report_sections(inputs: BeamDesignInputSet, results: BeamDesignResults) -> list[ReportSection]:
+    input_summary_rows = [
+        ReportRow("Design Code", "-", inputs.metadata.design_code.value, inputs.metadata.design_code.value, "-"),
+        ReportRow("Beam Type", "-", inputs.beam_type.value, inputs.beam_type.value, "-"),
+        ReportRow("Beam Behavior", "-", _beam_behavior_mode_summary(inputs), _beam_behavior_mode_summary(inputs), "-"),
+        ReportRow("Sections", "-", _active_section_names(inputs), _active_section_names(inputs), "-"),
+        ReportRow("Mu Mapping", "-", _mu_mapping_text(inputs), _mu_mapping_text(inputs), "-"),
+        ReportRow("Vu Mapping", "-", _vu_mapping_text(inputs), _vu_mapping_text(inputs), "-"),
+        ReportRow("Geometry", f"{_sym_b()} x {_sym_h()}, cover", f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)}, c={format_number(inputs.geometry.cover_cm)}", f"{format_number(inputs.geometry.width_cm)} x {format_number(inputs.geometry.depth_cm)} / {format_number(inputs.geometry.cover_cm)}", "cm"),
+        ReportRow("Mu", "-", _print_input_mu_value(inputs), _print_input_mu_value(inputs), "kg-m"),
+        ReportRow("Vu", "-", format_number(results.shear.input_factored_shear_kg), format_number(results.shear.input_factored_shear_kg), "kg"),
+    ]
+    cantilever_value = _cantilever_span_summary(inputs)
+    if cantilever_value is not None:
+        input_summary_rows.insert(3, ReportRow("Include Cantilever Span", "-", cantilever_value, cantilever_value, "-"))
+    sections = [
+        ReportSection(title="Input Summary", rows=input_summary_rows),
+        ReportSection(
+            title="Material Properties",
+            rows=[
+                ReportRow(f"{_sym_fc()}, {_sym_fy()}, {_sym_fvy()}", "-", f"{format_number(inputs.materials.concrete_strength_ksc)} / {format_number(inputs.materials.main_steel_yield_ksc)} / {format_number(inputs.materials.shear_steel_yield_ksc)}", f"{format_number(inputs.materials.concrete_strength_ksc)} / {format_number(inputs.materials.main_steel_yield_ksc)} / {format_number(inputs.materials.shear_steel_yield_ksc)}", "ksc"),
+                ReportRow(_sym_ec(), _format_default_ec_logic(), _material_substitution(results.materials.ec_mode.value, results.materials.ec_default_ksc, inputs.material_settings.ec.manual_value), format_number(results.materials.ec_ksc), "ksc", results.materials.ec_mode.value, _material_note(results.materials.ec_mode.value, results.materials.ec_default_logic)),
+                ReportRow(_sym_es(), _format_default_es_logic(), _material_substitution(results.materials.es_mode.value, results.materials.es_default_ksc, inputs.material_settings.es.manual_value), format_number(results.materials.es_ksc), "ksc", results.materials.es_mode.value, _material_note(results.materials.es_mode.value, results.materials.es_default_logic)),
+                ReportRow(_sym_fr(), _format_default_fr_logic(), _material_substitution(results.materials.fr_mode.value, results.materials.fr_default_ksc, inputs.material_settings.fr.manual_value), format_number(results.materials.modulus_of_rupture_fr_ksc), "ksc", results.materials.fr_mode.value, _material_note(results.materials.fr_mode.value, results.materials.fr_default_logic)),
+                ReportRow(_sym_beta1(), "-", f"{_sym_fc()} = {format_number(inputs.materials.concrete_strength_ksc)}", format_ratio(results.materials.beta_1), "-", note=VerificationStatus.VERIFIED_CODE.value),
+            ],
+        ),
+        ReportSection(title="Section Geometry", rows=[ReportRow("Spacing", f"{_primary_section_label(inputs)} tension spacing", results.beam_geometry.positive_tension_spacing.overall_status, results.beam_geometry.positive_tension_spacing.overall_status, "-")]),
+    ]
+    if inputs.has_simple_support_design and results.support_bending is not None:
+        sections.append(_build_support_section(inputs, results))
+    if inputs.has_positive_design:
+        positive_title = "Middle Moment Design" if inputs.beam_type == BeamType.SIMPLE else "Positive Moment Design"
+        sections.append(ReportSection(title=positive_title, rows=[ReportRow("Tension Reinforcement", "Bottom bars", _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"), ReportRow("Compression Reinforcement", "Top bars", _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.positive_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Top bars"), ReportRow(f"{_sym_as_req()} / {_sym_as_prov()}", f"{_sym_rho_req()} {_sym_b()} d, sum(bar areas)", "Positive bending", f"{format_number(results.positive_bending.as_required_cm2)} / {format_number(results.positive_bending.as_provided_cm2)}", _unit_cm2(), results.positive_bending.as_status), ReportRow(f"{_sym_mn()} / {_sym_phi_mn()}", f"{_sym_as()} {_sym_fy()} (d - a/2), Ï†{_sym_mn()}", "Positive bending", f"{format_number(results.positive_bending.mn_kgm)} / {format_number(results.positive_bending.phi_mn_kgm)}", "kg-m", results.positive_bending.design_status)]))
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        sections.append(ReportSection(title="Negative Moment Design", rows=[ReportRow("Tension Reinforcement", "Top bars", _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"), ReportRow("Compression Reinforcement", "Bottom bars", _format_arrangement(inputs.negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Bottom bars"), ReportRow("As req. / prov.", "rho_req * b * d-, sum(bar areas)", "Negative bending", f"{format_number(results.negative_bending.as_required_cm2)} / {format_number(results.negative_bending.as_provided_cm2)}", "cm2", results.negative_bending.as_status), ReportRow("Mn / phiMn", _moment_capacity_summary_equation(results.negative_bending, "As * fy * (d- - a/2), phi*Mn"), "Negative bending", f"{format_number(results.negative_bending.mn_kgm)} / {format_number(results.negative_bending.phi_mn_kgm)}", "kg-m", results.negative_bending.design_status)]))
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        sections.append(ReportSection(title="Cantilever Negative Moment Design", rows=[ReportRow("Tension Reinforcement", "Top bars", _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.tension_reinforcement, inputs.materials.main_steel_yield_ksc), "-"), ReportRow("Compression Reinforcement", "Bottom bars", _format_arrangement(inputs.cantilever_negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), _format_arrangement(inputs.cantilever_negative_bending.compression_reinforcement, inputs.materials.main_steel_yield_ksc), "-", note="Bottom bars"), ReportRow("As req. / prov.", "rho_req * b * d-, sum(bar areas)", "Cantilever negative bending", f"{format_number(results.cantilever_negative_bending.as_required_cm2)} / {format_number(results.cantilever_negative_bending.as_provided_cm2)}", "cm2", results.cantilever_negative_bending.as_status), ReportRow("Mn / phiMn", _moment_capacity_summary_equation(results.cantilever_negative_bending, "As * fy * (d- - a/2), phi*Mn"), "Cantilever negative bending", f"{format_number(results.cantilever_negative_bending.mn_kgm)} / {format_number(results.cantilever_negative_bending.phi_mn_kgm)}", "kg-m", results.cantilever_negative_bending.design_status)]))
+    sections.append(ReportSection(title="Shear Design", rows=[ReportRow(f"{_sym_vu()} / {_sym_phi_vc()}", "Demand / concrete capacity", format_number(results.shear.input_factored_shear_kg), format_number(results.shear.phi_vc_kg), "kg", results.shear.design_status), ReportRow("Basis", "-", f"{results.shear.region_label} -> {results.shear.design_section_label}", results.shear.design_section_label, "-", results.shear.design_status), ReportRow("Req. spacing", "governing spacing s", "Strength and code spacing limits", format_number(results.shear.required_spacing_cm), "cm", results.shear.design_status), ReportRow("Prov. spacing", f"{results.shear.spacing_mode.value} spacing", f"db={inputs.shear.stirrup_diameter_mm} mm, legs={inputs.shear.legs_per_plane}", format_number(results.shear.provided_spacing_cm), "cm", results.shear.design_status), ReportRow(_sym_phi_vs(), f"Ï† {_sym_av()} {_sym_fvy()} d / s", f"{results.shear.phi:.3f} x {_sym_av()} x {format_number(inputs.materials.shear_steel_yield_ksc)} x d / {format_number(results.shear.provided_spacing_cm)}", format_number(results.shear.phi_vs_provided_kg), "kg"), ReportRow(f"{_sym_vn()} / {_sym_phi_vn()}", f"{_sym_vc()} + {_sym_vs()}(provided), Ï†{_sym_vn()}", f"{format_number(results.shear.vn_kg)} / {format_number(results.shear.phi_vn_kg)}", f"{format_number(results.shear.vn_kg)} / {format_number(results.shear.phi_vn_kg)}", "kg", results.shear.design_status), ReportRow("Shear capacity ratio", f"{_sym_vu()} / {_sym_phi_vn()}", f"{format_number(results.shear.input_factored_shear_kg)} / {format_number(results.shear.phi_vn_kg)}", format_ratio(results.shear.capacity_ratio), "-", results.shear.design_status)]))
+    if inputs.torsion.enabled:
+        sections.append(_build_print_torsion_section(results))
+    if inputs.consider_deflection:
+        sections.append(_build_print_deflection_section(results))
+    for index, section in enumerate(sections):
+        if section.title in {"Positive Moment Design", "Middle Moment Design"}:
+            sections[index] = _with_updated_moment_summary_row(section, results.positive_bending)
+        elif section.title == "Support Moment Design" and results.support_bending is not None:
+            sections[index] = _with_updated_moment_summary_row(section, results.support_bending)
+        elif section.title == "Negative Moment Design" and results.negative_bending is not None:
+            sections[index] = _with_updated_moment_summary_row(section, results.negative_bending)
+        elif section.title == "Cantilever Negative Moment Design" and results.cantilever_negative_bending is not None:
+            sections[index] = _with_updated_moment_summary_row(section, results.cantilever_negative_bending)
+    sections.append(_build_print_design_summary(inputs, results))
+    return sections

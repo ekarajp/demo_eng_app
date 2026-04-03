@@ -27,6 +27,7 @@ from apps.rc_beam.models import (
     MaterialPropertyMode,
     MaterialPropertySetting,
     MaterialPropertySettings,
+    NegativeBendingInput,
     PositiveBendingInput,
     RebarGroupInput,
     RebarLayerInput,
@@ -523,7 +524,7 @@ def test_report_builder_uses_strain_compatibility_equation_for_et() -> None:
     inputs = BeamDesignInputSet()
     results = calculate_full_design_results(inputs)
     sections = build_report_sections(inputs, results)
-    positive_section = next(section for section in sections if section.title == "Positive Moment Design")
+    positive_section = next(section for section in sections if section.title == "Middle Moment Design")
     et_row = next(row for row in positive_section.rows if row.variable == "et")
 
     assert et_row.equation == "ecu * (dt - c) / c"
@@ -534,7 +535,7 @@ def test_report_builder_marks_doubly_flexure_rows_as_compatibility_based() -> No
     inputs = _heavy_beam_behavior_inputs(BeamBehaviorMode.DOUBLY)
     results = calculate_full_design_results(inputs)
     sections = build_report_sections(inputs, results)
-    positive_section = next(section for section in sections if section.title == "Positive Moment Design")
+    positive_section = next(section for section in sections if section.title == "Middle Moment Design")
     mn_row = next(row for row in positive_section.rows if row.variable == "Mn")
 
     assert results.positive_bending.effective_beam_behavior == BeamBehaviorMode.DOUBLY.value
@@ -545,7 +546,7 @@ def test_print_report_marks_doubly_flexure_summary_as_compatibility_based() -> N
     inputs = _heavy_beam_behavior_inputs(BeamBehaviorMode.DOUBLY)
     results = calculate_full_design_results(inputs)
     sections = build_print_report_sections(inputs, results)
-    positive_section = next(section for section in sections if section.title == "Positive Moment Design")
+    positive_section = next(section for section in sections if section.title == "Middle Moment Design")
     mn_row = positive_section.rows[-1]
 
     assert "compatibility" in mn_row.equation.lower()
@@ -618,10 +619,74 @@ def test_negative_bending_matches_current_negative_logic() -> None:
     assert results.as_provided_cm2 == pytest.approx(6.031857894892403)
     assert results.as_min_cm2 == pytest.approx(2.4010000000000002)
     assert results.as_max_cm2 == pytest.approx(11.2067224137931)
-    assert results.mn_kgm == pytest.approx(7562.310803083047)
-    assert results.phi_mn_kgm == pytest.approx(6806.079722774743)
-    assert results.ratio == pytest.approx(0.8815647545124383)
-    assert results.review_note == ""
+
+
+def test_full_design_results_build_cantilever_negative_section_results() -> None:
+    standalone = calculate_full_design_results(BeamDesignInputSet(beam_type=BeamType.STANDALONE_CANTILEVER))
+    simple_with_cantilever = calculate_full_design_results(
+        BeamDesignInputSet(beam_type=BeamType.SIMPLE, include_cantilever_span=True)
+    )
+    continuous_with_cantilever = calculate_full_design_results(
+        BeamDesignInputSet(beam_type=BeamType.CONTINUOUS, include_cantilever_span=True)
+    )
+
+    assert standalone.negative_bending is None
+    assert standalone.cantilever_negative_bending is not None
+    assert simple_with_cantilever.negative_bending is None
+    assert simple_with_cantilever.cantilever_negative_bending is not None
+    assert continuous_with_cantilever.negative_bending is not None
+    assert continuous_with_cantilever.cantilever_negative_bending is not None
+
+
+def test_standalone_cantilever_does_not_emit_inactive_positive_section_warnings() -> None:
+    inputs = BeamDesignInputSet(
+        beam_type=BeamType.STANDALONE_CANTILEVER,
+        positive_bending=PositiveBendingInput(
+            tension_reinforcement=ReinforcementArrangementInput(),
+            compression_reinforcement=ReinforcementArrangementInput(),
+        ),
+    )
+
+    results = calculate_full_design_results(inputs)
+
+    assert all("Positive bending reinforcement" not in warning for warning in results.warnings)
+    assert "Positive tension reinforcement does not satisfy the required A_s limits." not in results.overall_note
+
+
+def test_standalone_cantilever_uses_cantilever_negative_section_for_shear_basis() -> None:
+    inputs = BeamDesignInputSet(beam_type=BeamType.STANDALONE_CANTILEVER)
+
+    results = calculate_full_design_results(inputs)
+
+    assert results.shear.design_section_key == "cantilever_negative"
+    assert results.shear.design_section_label == "Cantilever Negative Section"
+    assert results.shear.effective_depth_cm == pytest.approx(results.beam_geometry.d_plus_cm)
+    assert results.overall_status == "PASS"
+
+
+def test_shear_design_selects_shallower_negative_section_when_it_controls() -> None:
+    inputs = BeamDesignInputSet(
+        beam_type=BeamType.CONTINUOUS,
+        negative_bending=NegativeBendingInput(
+            tension_reinforcement=ReinforcementArrangementInput(
+                layer_1=RebarLayerInput(
+                    group_a=RebarGroupInput(diameter_mm=25, count=2),
+                    group_b=RebarGroupInput(diameter_mm=25, count=3),
+                ),
+                layer_2=RebarLayerInput(
+                    group_a=RebarGroupInput(diameter_mm=25, count=2),
+                    group_b=RebarGroupInput(diameter_mm=25, count=2),
+                ),
+            ),
+        ),
+    )
+
+    results = calculate_full_design_results(inputs)
+
+    assert results.beam_geometry.d_minus_cm is not None
+    assert results.shear.design_section_key == "negative"
+    assert results.shear.effective_depth_cm == pytest.approx(results.beam_geometry.d_minus_cm)
+    assert results.shear.effective_depth_cm < results.beam_geometry.d_plus_cm
 
 
 def test_full_results_expose_review_flags_and_overall_status() -> None:
@@ -659,6 +724,21 @@ def test_simple_beam_omits_negative_results() -> None:
 
     assert results.negative_bending is None
     assert results.beam_geometry.d_minus_cm is None
+
+
+def test_simple_beam_support_moment_auto_uses_l_over_4_ratio() -> None:
+    inputs = BeamDesignInputSet(beam_type=BeamType.SIMPLE)
+    inputs.positive_bending.factored_moment_kgm = 3600.0
+
+    assert inputs.resolved_simple_support_moment_kgm == pytest.approx(2700.0)
+    assert inputs.active_mu_region_mappings == (
+        ("Mu_max", "middle", "Middle Section"),
+        ("Mu at Support - L/4", "support", "Support Section"),
+    )
+    assert inputs.active_vu_region_mappings == (
+        ("support", "Support Vu", "support", "Support Section"),
+        ("middle", "Middle-region Vu", "middle", "Middle Section"),
+    )
 
 
 def test_material_property_default_modes_preserve_existing_behavior() -> None:

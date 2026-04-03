@@ -5,7 +5,7 @@ from apps.rc_beam.calculation_report_page import _render_print_section, render_p
 from apps.rc_beam.formulas import calculate_full_design_results
 from apps.rc_beam.models import BeamDesignInputSet, BeamType
 from apps.rc_beam.models import ProjectMetadata
-from apps.rc_beam.models import PositiveBendingInput, ReinforcementArrangementInput
+from apps.rc_beam.models import NegativeBendingInput, PositiveBendingInput, RebarGroupInput, RebarLayerInput, ReinforcementArrangementInput
 from apps.rc_beam.report_builder import (
     ReportRow,
     build_full_report_overview_data,
@@ -162,7 +162,8 @@ def test_full_report_adds_torsion_and_deflection_sections_only_when_enabled() ->
     assert "Negative Moment Design" not in titles
     assert "Torsion Design" in html
     assert "Deflection Check" in html
-    assert "aria-label=\"Positive Moment Flexural" in html
+    assert "Middle Moment Design" in html
+    assert "Support Moment Design" in html
     assert "Shear-Torsion interaction diagram" in html
     assert "Deflection reference diagram" in html
 
@@ -178,6 +179,68 @@ def test_full_report_includes_negative_section_only_for_continuous_beam() -> Non
     assert "Negative Moment Design" in titles
     assert "Support section" in html
     assert "aria-label=\"Negative Moment Flexural" in html
+
+
+def test_summary_report_header_includes_cantilever_metadata_for_simple_beam_option() -> None:
+    inputs = BeamDesignInputSet(beam_type=BeamType.SIMPLE, include_cantilever_span=True)
+    results = calculate_full_design_results(inputs)
+    sections = build_summary_table_sections(inputs, results)
+    html = render_print_layout(inputs, results, sections, LIGHT_THEME)
+
+    assert "Include Cantilever Span: Yes" in html
+    assert "Sections: Middle Section, Support Section, Cantilever Negative Section" in html
+
+
+def test_full_report_includes_cantilever_section_when_enabled() -> None:
+    inputs = BeamDesignInputSet(beam_type=BeamType.CONTINUOUS, include_cantilever_span=True)
+    results = calculate_full_design_results(inputs)
+    sections = build_full_report_sections(inputs, results)
+    overview = build_full_report_overview_data(inputs, results)
+    html = render_full_report_layout(inputs, results, overview, sections, LIGHT_THEME)
+    titles = [section.title for section in sections]
+
+    assert "Cantilever Negative Moment Design" in titles
+    assert "Include Cantilever Span" in html
+    assert "Sections" in html
+    assert "Cantilever Negative Section" in html
+
+
+def test_full_report_uses_cantilever_negative_labels_for_standalone_cantilever() -> None:
+    inputs = BeamDesignInputSet(beam_type=BeamType.STANDALONE_CANTILEVER)
+    results = calculate_full_design_results(inputs)
+    sections = build_full_report_sections(inputs, results)
+    overview = build_full_report_overview_data(inputs, results)
+    html = render_full_report_layout(inputs, results, overview, sections, LIGHT_THEME)
+    titles = [section.title for section in sections]
+    shear_section = next(section for section in sections if section.title == "Shear Design")
+
+    assert "Positive Moment Design" not in titles
+    assert "Cantilever Negative Moment Design" in titles
+    assert "Cantilever Negative Section" in html
+    assert any(row.variable == "Section basis" and row.result == "Cantilever Negative Section" for row in shear_section.rows)
+
+
+def test_summary_report_exposes_shear_basis_for_negative_governed_case() -> None:
+    inputs = BeamDesignInputSet(
+        beam_type=BeamType.CONTINUOUS,
+        negative_bending=NegativeBendingInput(
+            tension_reinforcement=ReinforcementArrangementInput(
+                layer_1=RebarLayerInput(
+                    group_a=RebarGroupInput(diameter_mm=25, count=2),
+                    group_b=RebarGroupInput(diameter_mm=25, count=3),
+                ),
+                layer_2=RebarLayerInput(
+                    group_a=RebarGroupInput(diameter_mm=25, count=2),
+                    group_b=RebarGroupInput(diameter_mm=25, count=2),
+                ),
+            ),
+        ),
+    )
+    results = calculate_full_design_results(inputs)
+    sections = build_summary_table_sections(inputs, results)
+    shear_section = next(section for section in sections if section.title == "Shear")
+
+    assert any(row.variable == "Basis" and row.result == "Negative Section" for row in shear_section.rows)
 
 
 def test_full_report_hides_empty_reinforcement_faces_in_section_detail() -> None:

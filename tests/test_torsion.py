@@ -26,7 +26,7 @@ def test_torsion_checkbox_off_keeps_old_sections_unchanged() -> None:
         "Input Summary",
         "Material Properties",
         "Section Geometry",
-        "Positive Moment Design",
+        "Middle Moment Design",
         "Shear Design",
         "Final Design Summary",
     ]

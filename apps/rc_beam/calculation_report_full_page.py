@@ -217,6 +217,12 @@ def _render_cover_page(inputs, results, overview, palette, page_number: int, tot
                 {_meta_item("Date", inputs.metadata.design_date or "-")}
                 {_meta_item("Code", inputs.metadata.design_code.value)}
                 {_meta_item("Beam Type", inputs.beam_type.value)}
+                {
+                    _meta_item("Include Cantilever Span", "Yes" if inputs.include_cantilever_span else "No")
+                    if inputs.beam_type.value in {"Simple Beam", "Continuous Beam"}
+                    else ""
+                }
+                {_meta_item("Sections", ", ".join(label for _, label in inputs.active_flexural_sections))}
                 {_meta_item("Overall Status", results.overall_status)}
               </div>
             </div>

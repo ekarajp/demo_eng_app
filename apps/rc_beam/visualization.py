@@ -318,21 +318,26 @@ def _torsion_surface_priority(surface_counts: dict[str, int]) -> tuple[str, ...]
 
 
 def normalize_moment_case(inputs: BeamDesignInputSet, moment_case: str) -> str:
-    if not inputs.has_negative_design:
+    active_cases = [key for key, _ in inputs.active_flexural_sections]
+    if moment_case in active_cases:
+        return moment_case
+    if "middle" in active_cases:
+        return "middle"
+    if "support" in active_cases:
+        return "support"
+    if "positive" in active_cases:
         return "positive"
-    return "negative" if moment_case == "negative" else "positive"
+    if "negative" in active_cases:
+        return "negative"
+    return "cantilever_negative"
 
 
 def available_moment_cases(inputs: BeamDesignInputSet) -> list[str]:
-    if inputs.has_negative_design:
-        return ["positive", "negative"]
-    return ["positive"]
+    return [key for key, _ in inputs.active_flexural_sections]
 
 
 def beam_section_specs(inputs: BeamDesignInputSet) -> list[tuple[str, str]]:
-    if inputs.has_negative_design:
-        return [("Positive", "positive"), ("Negative", "negative")]
-    return [("Beam Section", "positive")]
+    return [(label, key) for key, label in inputs.active_flexural_sections]
 
 
 def shared_drawing_transform(inputs: BeamDesignInputSet) -> "DrawingTransform":
@@ -480,8 +485,23 @@ def build_flexural_phi_chart_svg(theme: ThemePalette, state: PhiFlexureChartStat
 
 def _select_arrangements(inputs: BeamDesignInputSet, moment_case: str) -> tuple[ReinforcementArrangementInput, ReinforcementArrangementInput]:
     normalized_case = normalize_moment_case(inputs, moment_case)
+    if normalized_case == "support":
+        return (
+            inputs.simple_support_bending.compression_reinforcement,
+            inputs.simple_support_bending.tension_reinforcement,
+        )
+    if normalized_case == "middle":
+        return (
+            inputs.positive_bending.compression_reinforcement,
+            inputs.positive_bending.tension_reinforcement,
+        )
     if normalized_case == "negative":
         return (inputs.negative_bending.tension_reinforcement, inputs.negative_bending.compression_reinforcement)
+    if normalized_case == "cantilever_negative":
+        return (
+            inputs.cantilever_negative_bending.tension_reinforcement,
+            inputs.cantilever_negative_bending.compression_reinforcement,
+        )
     return (inputs.positive_bending.compression_reinforcement, inputs.positive_bending.tension_reinforcement)
 
 

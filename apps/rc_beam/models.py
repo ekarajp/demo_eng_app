@@ -25,6 +25,7 @@ class DesignCode(str, Enum):
 
 
 class BeamType(str, Enum):
+    STANDALONE_CANTILEVER = "Standalone Cantilever Beam"
     SIMPLE = "Simple Beam"
     CONTINUOUS = "Continuous Beam"
 
@@ -55,6 +56,11 @@ class MaterialPropertyMode(str, Enum):
 
 
 class ShearSpacingMode(str, Enum):
+    AUTO = "Auto"
+    MANUAL = "Manual"
+
+
+class DemandInputMode(str, Enum):
     AUTO = "Auto"
     MANUAL = "Manual"
 
@@ -224,6 +230,11 @@ class PositiveBendingInput:
 @dataclass(slots=True)
 class ShearDesignInput:
     factored_shear_kg: float = 5000.0
+    support_factored_shear_kg: float | None = None
+    span_region_factored_shear_kg: float | None = None
+    cantilever_factored_shear_kg: float | None = None
+    span_region_mode: DemandInputMode = DemandInputMode.AUTO
+    span_region_relative_position: float = 0.25
     stirrup_diameter_mm: int = 9
     legs_per_plane: int = 2
     spacing_mode: ShearSpacingMode = ShearSpacingMode.AUTO
@@ -231,9 +242,33 @@ class ShearDesignInput:
 
     def __post_init__(self) -> None:
         _validate_non_negative(self.factored_shear_kg, "factored_shear_kg")
+        if self.support_factored_shear_kg is not None:
+            _validate_non_negative(self.support_factored_shear_kg, "support_factored_shear_kg")
+        if self.span_region_factored_shear_kg is not None:
+            _validate_non_negative(self.span_region_factored_shear_kg, "span_region_factored_shear_kg")
+        if self.cantilever_factored_shear_kg is not None:
+            _validate_non_negative(self.cantilever_factored_shear_kg, "cantilever_factored_shear_kg")
+        if not 0.25 <= self.span_region_relative_position <= 0.75:
+            raise ValueError("span_region_relative_position must be between 0.25 and 0.75.")
         _validate_positive(self.stirrup_diameter_mm, "stirrup_diameter_mm")
         _validate_positive(self.legs_per_plane, "legs_per_plane")
         _validate_positive(self.provided_spacing_cm, "provided_spacing_cm")
+
+    @property
+    def resolved_support_factored_shear_kg(self) -> float:
+        return self.factored_shear_kg if self.support_factored_shear_kg is None else self.support_factored_shear_kg
+
+    @property
+    def resolved_span_region_factored_shear_kg(self) -> float:
+        if self.span_region_factored_shear_kg is not None:
+            return self.span_region_factored_shear_kg
+        return self.factored_shear_kg
+
+    @property
+    def resolved_cantilever_factored_shear_kg(self) -> float:
+        if self.cantilever_factored_shear_kg is not None:
+            return self.cantilever_factored_shear_kg
+        return self.factored_shear_kg
 
 
 @dataclass(slots=True)
@@ -249,6 +284,28 @@ class NegativeBendingInput:
             layer_1=RebarLayerInput(
                 group_a=RebarGroupInput(diameter_mm=16, count=2),
                 group_b=RebarGroupInput(diameter_mm=16, count=1),
+            ),
+        )
+    )
+
+    def __post_init__(self) -> None:
+        _validate_non_negative(self.factored_moment_kgm, "factored_moment_kgm")
+
+
+@dataclass(slots=True)
+class SimpleSupportBendingInput:
+    moment_mode: DemandInputMode = DemandInputMode.AUTO
+    factored_moment_kgm: float = 3500.0
+    compression_reinforcement: ReinforcementArrangementInput = field(
+        default_factory=lambda: ReinforcementArrangementInput(
+            layer_1=RebarLayerInput(group_a=RebarGroupInput(diameter_mm=12, count=2)),
+        )
+    )
+    tension_reinforcement: ReinforcementArrangementInput = field(
+        default_factory=lambda: ReinforcementArrangementInput(
+            layer_1=RebarLayerInput(
+                group_a=RebarGroupInput(diameter_mm=12, count=2),
+                group_b=RebarGroupInput(diameter_mm=12, count=1),
             ),
         )
     )
@@ -317,6 +374,7 @@ class DeflectionCheckInput:
 @dataclass(slots=True)
 class BeamDesignInputSet:
     beam_type: BeamType = BeamType.SIMPLE
+    include_cantilever_span: bool = False
     beam_behavior_mode: BeamBehaviorMode = BeamBehaviorMode.AUTO
     auto_beam_behavior_threshold_ratio: float = 0.05
     consider_deflection: bool = False
@@ -324,15 +382,104 @@ class BeamDesignInputSet:
     materials: MaterialPropertiesInput = field(default_factory=MaterialPropertiesInput)
     geometry: BeamGeometryInput = field(default_factory=BeamGeometryInput)
     positive_bending: PositiveBendingInput = field(default_factory=PositiveBendingInput)
+    simple_support_bending: SimpleSupportBendingInput = field(default_factory=SimpleSupportBendingInput)
     shear: ShearDesignInput = field(default_factory=ShearDesignInput)
     torsion: TorsionDesignInput = field(default_factory=TorsionDesignInput)
     negative_bending: NegativeBendingInput = field(default_factory=NegativeBendingInput)
+    cantilever_negative_bending: NegativeBendingInput = field(default_factory=NegativeBendingInput)
     deflection: DeflectionCheckInput = field(default_factory=DeflectionCheckInput)
     material_settings: MaterialPropertySettings = field(default_factory=MaterialPropertySettings)
 
     @property
     def has_negative_design(self) -> bool:
+        return self.has_support_negative_design
+
+    @property
+    def has_simple_support_design(self) -> bool:
+        return self.beam_type == BeamType.SIMPLE
+
+    @property
+    def has_positive_design(self) -> bool:
+        return self.beam_type != BeamType.STANDALONE_CANTILEVER
+
+    @property
+    def has_support_negative_design(self) -> bool:
         return self.beam_type == BeamType.CONTINUOUS
+
+    @property
+    def has_cantilever_negative_design(self) -> bool:
+        if self.beam_type == BeamType.STANDALONE_CANTILEVER:
+            return True
+        if self.beam_type in {BeamType.SIMPLE, BeamType.CONTINUOUS}:
+            return self.include_cantilever_span
+        return False
+
+    @property
+    def active_flexural_sections(self) -> tuple[tuple[str, str], ...]:
+        sections: list[tuple[str, str]] = []
+        if self.has_simple_support_design:
+            sections.append(("middle", "Middle Section"))
+            sections.append(("support", "Support Section"))
+        elif self.beam_type == BeamType.CONTINUOUS:
+            sections.append(("positive", "Positive Section"))
+            sections.append(("negative", "Negative Section"))
+        if self.has_cantilever_negative_design:
+            sections.append(("cantilever_negative", "Cantilever Negative Section"))
+        return tuple(sections)
+
+    @property
+    def active_vu_region_mappings(self) -> tuple[tuple[str, str, str, str], ...]:
+        if self.beam_type == BeamType.STANDALONE_CANTILEVER:
+            return (("cantilever", "Cantilever Vu", "cantilever_negative", "Cantilever Negative Section"),)
+        if self.beam_type == BeamType.SIMPLE:
+            mappings: list[tuple[str, str, str, str]] = [
+                ("support", "Support Vu", "support", "Support Section"),
+                ("middle", "Middle-region Vu", "middle", "Middle Section"),
+            ]
+            if self.include_cantilever_span:
+                mappings.append(
+                    ("cantilever", "Cantilever Vu", "cantilever_negative", "Cantilever Negative Section")
+                )
+            return tuple(mappings)
+        mappings = [
+            ("support", "Support Vu", "negative", "Negative Section"),
+            ("span_region", "Span-region Vu", "positive", "Positive Section"),
+        ]
+        if self.include_cantilever_span:
+            mappings.append(
+                ("cantilever", "Cantilever Vu", "cantilever_negative", "Cantilever Negative Section")
+            )
+        return tuple(mappings)
+
+    @property
+    def active_mu_region_mappings(self) -> tuple[tuple[str, str, str], ...]:
+        if self.beam_type == BeamType.SIMPLE:
+            mappings: list[tuple[str, str, str]] = [
+                ("Mu_max", "middle", "Middle Section"),
+                ("Mu at Support - L/4", "support", "Support Section"),
+            ]
+            if self.include_cantilever_span:
+                mappings.append(("Cantilever Negative Mu", "cantilever_negative", "Cantilever Negative Section"))
+            return tuple(mappings)
+        mappings = []
+        if self.beam_type == BeamType.CONTINUOUS:
+            mappings.extend(
+                [
+                    ("Mu_max", "positive", "Positive Section"),
+                    ("Support Negative Mu", "negative", "Negative Section"),
+                ]
+            )
+        elif self.beam_type == BeamType.STANDALONE_CANTILEVER:
+            mappings.append(("Cantilever Negative Mu", "cantilever_negative", "Cantilever Negative Section"))
+        if self.include_cantilever_span:
+            mappings.append(("Cantilever Negative Mu", "cantilever_negative", "Cantilever Negative Section"))
+        return tuple(mappings)
+
+    @property
+    def resolved_simple_support_moment_kgm(self) -> float:
+        if self.simple_support_bending.moment_mode == DemandInputMode.MANUAL:
+            return self.simple_support_bending.factored_moment_kgm
+        return self.positive_bending.factored_moment_kgm * 0.75
 
 
 @dataclass(slots=True)
@@ -462,6 +609,14 @@ class ShearDesignResults:
     section_change_required: bool = False
     section_change_note: str = ""
     review_note: str = ""
+    region_key: str = "support"
+    region_label: str = "Support Vu"
+    input_factored_shear_kg: float = 0.0
+    auto_calculated: bool = False
+    location_note: str = ""
+    design_section_key: str = "positive"
+    design_section_label: str = "Positive"
+    effective_depth_cm: float = 0.0
 
 
 @dataclass(slots=True)
@@ -569,16 +724,20 @@ class BeamDesignResults:
     torsion: TorsionDesignResults
     combined_shear_torsion: CombinedShearTorsionResults
     negative_bending: FlexuralDesignResults | None
+    cantilever_negative_bending: FlexuralDesignResults | None
     deflection: DeflectionCheckResults
     warnings: list[str]
     review_flags: list[ReviewFlag]
     overall_status: str
     overall_note: str = ""
+    support_bending: FlexuralDesignResults | None = None
+    shear_regions: tuple[ShearDesignResults, ...] = ()
 
 
 def default_beam_design_inputs() -> BeamDesignInputSet:
     return BeamDesignInputSet(
         beam_type=BeamType.SIMPLE,
+        include_cantilever_span=False,
         beam_behavior_mode=BeamBehaviorMode.AUTO,
         auto_beam_behavior_threshold_ratio=0.05,
         metadata=ProjectMetadata(design_code=DesignCode.ACI318_19, tag=""),
@@ -612,6 +771,7 @@ def default_beam_design_inputs() -> BeamDesignInputSet:
             spacing_mode=ShearSpacingMode.AUTO,
             provided_spacing_cm=15.0,
         ),
+        cantilever_negative_bending=NegativeBendingInput(),
     )
 
 

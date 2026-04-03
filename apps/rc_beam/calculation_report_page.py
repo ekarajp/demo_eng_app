@@ -151,6 +151,12 @@ def render_print_layout(inputs, results, sections, palette) -> str:
         f"<span>{item}</span>"
         for item in [
             f"Beam Type: {inputs.beam_type.value}",
+            *(
+                [f"Include Cantilever Span: {'Yes' if inputs.include_cantilever_span else 'No'}"]
+                if inputs.beam_type.value in {"Simple Beam", "Continuous Beam"}
+                else []
+            ),
+            f"Sections: {', '.join(label for _, label in inputs.active_flexural_sections)}",
             f"Code: {inputs.metadata.design_code.value}",
             f"Overall Status: {results.overall_status}",
         ]

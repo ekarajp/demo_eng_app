@@ -39,6 +39,7 @@ from .models import (
     BeamDesignInputSet,
     BeamGeometryInput,
     BeamType,
+    DemandInputMode,
     DeflectionBeamType,
     DeflectionCheckInput,
     DesignCode,
@@ -54,6 +55,7 @@ from .models import (
     ReinforcementArrangementInput,
     ShearDesignInput,
     ShearSpacingMode,
+    SimpleSupportBendingInput,
     default_beam_design_inputs,
 )
 from .visualization import (
@@ -108,7 +110,7 @@ def main() -> None:
     with left:
         st.markdown("<div class='workspace-panel'>", unsafe_allow_html=True)
         render_header()
-        render_input_workspace()
+        render_input_workspace_extended()
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -140,6 +142,7 @@ def initialize_session_state(default_inputs: BeamDesignInputSet, *, force_restor
 def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
     state: dict[str, object] = {
         "beam_type": inputs.beam_type.value,
+        "include_cantilever_span": inputs.include_cantilever_span,
         "beam_behavior_mode": inputs.beam_behavior_mode.value,
         "auto_beam_behavior_threshold_percent": inputs.auto_beam_behavior_threshold_ratio * 100.0,
         "project_tag": inputs.metadata.tag,
@@ -165,8 +168,15 @@ def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
         "cover_cm": inputs.geometry.cover_cm,
         "min_clear_spacing_cm": inputs.geometry.minimum_clear_spacing_cm,
         "positive_mu_kgm": inputs.positive_bending.factored_moment_kgm,
+        "support_mu_mode": inputs.simple_support_bending.moment_mode.value,
+        "support_mu_kgm": inputs.simple_support_bending.factored_moment_kgm,
         "negative_mu_kgm": inputs.negative_bending.factored_moment_kgm,
         "vu_kg": inputs.shear.factored_shear_kg,
+        "support_vu_kg": inputs.shear.resolved_support_factored_shear_kg,
+        "span_vu_mode": inputs.shear.span_region_mode.value,
+        "span_vu_kg": inputs.shear.resolved_span_region_factored_shear_kg,
+        "span_vu_position_ratio": inputs.shear.span_region_relative_position,
+        "cantilever_vu_kg": inputs.shear.resolved_cantilever_factored_shear_kg,
         "stirrup_diameter_option": _diameter_option(inputs.shear.stirrup_diameter_mm, allow_empty=False),
         "stirrup_diameter_mm": int(inputs.shear.stirrup_diameter_mm),
         "legs_per_plane": inputs.shear.legs_per_plane,
@@ -210,8 +220,12 @@ def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
     for prefix, arrangement in {
         "pb_comp": inputs.positive_bending.compression_reinforcement,
         "pb_tens": inputs.positive_bending.tension_reinforcement,
+        "sb_comp": inputs.simple_support_bending.compression_reinforcement,
+        "sb_tens": inputs.simple_support_bending.tension_reinforcement,
         "nb_comp": inputs.negative_bending.compression_reinforcement,
         "nb_tens": inputs.negative_bending.tension_reinforcement,
+        "cb_comp": inputs.cantilever_negative_bending.compression_reinforcement,
+        "cb_tens": inputs.cantilever_negative_bending.tension_reinforcement,
     }.items():
         for layer_index, layer in enumerate(arrangement.layers(), start=1):
             state[f"{prefix}_layer_{layer_index}_group_a_diameter_option"] = _diameter_option(layer.group_a.diameter_mm, allow_empty=True)
@@ -221,6 +235,21 @@ def build_default_state(inputs: BeamDesignInputSet) -> dict[str, object]:
             state[f"{prefix}_layer_{layer_index}_group_b_diameter"] = layer.group_b.diameter_mm or 0
             state[f"{prefix}_layer_{layer_index}_group_b_count"] = layer.group_b.count
     for prefix in ("nb_tens", "nb_comp"):
+        state[f"{prefix}_layer_1_group_a_diameter_option"] = 12
+        state[f"{prefix}_layer_1_group_a_diameter"] = 12
+        state[f"{prefix}_layer_1_group_a_count"] = 2
+        state[f"{prefix}_layer_1_group_b_diameter_option"] = "-"
+        state[f"{prefix}_layer_1_group_b_diameter"] = 0
+        state[f"{prefix}_layer_1_group_b_count"] = 0
+        for layer_index in (2, 3):
+            state[f"{prefix}_layer_{layer_index}_group_a_diameter_option"] = "-"
+            state[f"{prefix}_layer_{layer_index}_group_a_diameter"] = 0
+            state[f"{prefix}_layer_{layer_index}_group_a_count"] = 0
+            state[f"{prefix}_layer_{layer_index}_group_b_diameter_option"] = "-"
+            state[f"{prefix}_layer_{layer_index}_group_b_diameter"] = 0
+            state[f"{prefix}_layer_{layer_index}_group_b_count"] = 0
+    state["cantilever_negative_mu_kgm"] = inputs.cantilever_negative_bending.factored_moment_kgm
+    for prefix in ("cb_tens", "cb_comp"):
         state[f"{prefix}_layer_1_group_a_diameter_option"] = 12
         state[f"{prefix}_layer_1_group_a_diameter"] = 12
         state[f"{prefix}_layer_1_group_a_count"] = 2
@@ -316,7 +345,7 @@ def render_input_workspace() -> None:
     with st.expander("2. Beam Type", expanded=True):
         st.radio(
             "Beam type",
-            options=[beam_type.value for beam_type in BeamType],
+            options=_beam_type_ui_options(),
             horizontal=True,
             key="beam_type",
             on_change=_handle_beam_type_change,
@@ -415,19 +444,244 @@ def render_input_workspace() -> None:
         with st.expander(_deflection_section_label(_selected_beam_type()), expanded=True):
             _render_deflection_section(preview_results)
 
+
+def render_input_workspace_extended() -> None:
+    preview_inputs, preview_results = _preview_current_design_state()
+    with st.expander("1. Project Info", expanded=True):
+        project_left, project_right = st.columns(2, gap="medium")
+        with project_left:
+            st.text_input("Tag", key="project_tag", help="Beam tag or member mark from the project.")
+            st.text_input("Project name", key="project_name")
+            st.selectbox("Design code", options=[code.value for code in DesignCode], key="design_code")
+        with project_right:
+            st.text_input("Project number", key="project_number")
+            st.text_input("Engineer", key="project_engineer")
+            st.radio("Date", options=["Auto", "Manual"], horizontal=True, key="project_date_mode")
+            if st.session_state.project_date_mode == "Manual":
+                st.text_input("Date / time", key="project_date")
+            else:
+                st.caption(f"Current date / time: {st.session_state.project_date_auto_value}")
+
+    with st.expander("2. Beam Type", expanded=True):
+        st.radio(
+            "Beam type",
+            options=_beam_type_ui_options(),
+            horizontal=True,
+            key="beam_type",
+            on_change=_handle_beam_type_change,
+            help="Select the flexural section pattern to expose the required design sections for this member or design region.",
+        )
+        if _selected_beam_type() in {BeamType.SIMPLE, BeamType.CONTINUOUS}:
+            st.checkbox("Include Cantilever Span", key="include_cantilever_span")
+        st.caption(
+            "Standalone Cantilever Beam = cantilever negative section only. "
+            "Simple Beam = positive section, with optional cantilever negative section. "
+            "Continuous Beam = positive and support negative sections, with optional cantilever negative section."
+        )
+        behavior_label_col, behavior_help_col = st.columns([0.88, 0.12], gap="small")
+        with behavior_label_col:
+            st.markdown("<div class='input-field-label'>Beam Behavior</div>", unsafe_allow_html=True)
+        with behavior_help_col:
+            _render_info_button(
+                "Beam Behavior:\n"
+                "- Singly: Ignore compression steel contribution for flexural strength classification\n"
+                "- Auto: Classify as Singly or Doubly based on compression steel contribution ratio R\n"
+                "- Doubly: Always include compression steel contribution\n\n"
+                "These labels describe flexural behavior only; they are not module names.",
+                label="?",
+            )
+        st.radio(
+            "Beam Behavior",
+            options=[mode.value for mode in BeamBehaviorMode],
+            horizontal=True,
+            key="beam_behavior_mode",
+            label_visibility="collapsed",
+        )
+        st.checkbox("Include Torsion Design", key="include_torsion_design", on_change=_handle_include_torsion_design_change)
+        st.checkbox("Consider Deflection", key="consider_deflection", on_change=_handle_consider_deflection_change)
+
+    with st.expander("3. Material Properties: f'c, fy, fvy", expanded=True):
+        cols = st.columns(3, gap="medium")
+        with cols[0]:
+            st.number_input("f'c (ksc)", min_value=1.0, step=5.0, key="fc_prime_ksc", help="Concrete compressive strength.")
+            _render_field_helper()
+        with cols[1]:
+            st.selectbox("fy (ksc)", options=STEEL_GRADE_OPTIONS, key="fy_grade_option", help="Main reinforcement yield strength.")
+            _render_steel_grade_input("fy_grade_option", "fy_ksc", "fy custom (ksc)")
+        with cols[2]:
+            st.selectbox("fvy (ksc)", options=STEEL_GRADE_OPTIONS, key="fvy_grade_option", help="Shear reinforcement yield strength.")
+            _render_steel_grade_input("fvy_grade_option", "fvy_ksc", "fvy custom (ksc)")
+
+    with st.expander("4. Beam Geometry: b, h, covering", expanded=True):
+        cols = st.columns(3, gap="medium")
+        with cols[0]:
+            st.number_input("b (cm)", min_value=1.0, step=1.0, key="width_cm")
+            _render_field_helper()
+        with cols[1]:
+            st.number_input("h (cm)", min_value=1.0, step=1.0, key="depth_cm")
+            _render_field_helper()
+        with cols[2]:
+            st.number_input("covering (cm)", min_value=0.0, step=0.5, key="cover_cm")
+            _render_field_helper()
+        spacing_cols = st.columns([1, 2], gap="medium")
+        with spacing_cols[0]:
+            st.number_input("min rebar spacing (cm)", min_value=0.1, step=0.1, key="min_clear_spacing_cm")
+            _render_field_helper()
+
+    for expander_title, config in _flexural_editor_configs():
+        with st.expander(expander_title, expanded=True):
+            if "moment_mode_key" in config:
+                st.radio(
+                    "Moment input mode",
+                    options=[mode.value for mode in DemandInputMode],
+                    key=config["moment_mode_key"],
+                    horizontal=True,
+                )
+                if st.session_state[config["moment_mode_key"]] == DemandInputMode.MANUAL.value:
+                    st.number_input(config["moment_label"], min_value=0.0, step=50.0, key=config["moment_key"])
+                else:
+                    auto_support_mu = float(st.session_state.positive_mu_kgm) * 0.75
+                    st.metric("Auto Mu at Support - L/4 (kg-m)", format_number(auto_support_mu))
+                    st.caption(config["moment_mode_auto_note"])
+            else:
+                st.number_input(config["moment_label"], min_value=0.0, step=50.0, key=config["moment_key"])
+            flexure_tabs = st.tabs(["Tension Reinforcement", "Compression Reinforcement"])
+            with flexure_tabs[0]:
+                st.caption(config["tension_caption"])
+                render_reinforcement_editor(
+                    config["tension_prefix"],
+                    "Tension Reinforcement",
+                    preview_inputs,
+                    preview_results,
+                    show_phi=True,
+                )
+            with flexure_tabs[1]:
+                st.caption(config["compression_caption"])
+                render_reinforcement_editor(
+                    config["compression_prefix"],
+                    "Compression Reinforcement",
+                    preview_inputs,
+                    preview_results,
+                    show_phi=False,
+                )
+
+    shear_section_label = _shear_design_section_label(st.session_state.include_torsion_design, _selected_beam_type())
+    with st.expander(shear_section_label, expanded=True):
+        _render_shear_header_feedback(preview_results)
+        _render_shear_inputs()
+        _render_shear_spacing_feedback()
+        if st.session_state.include_torsion_design:
+            _render_torsion_section(preview_results)
+    if st.session_state.consider_deflection:
+        with st.expander(_deflection_section_label(_selected_beam_type()), expanded=True):
+            _render_deflection_section(preview_results)
+
+
+def _flexural_editor_configs() -> list[tuple[str, dict[str, str]]]:
+    sections: list[dict[str, str]] = []
+    beam_type = _selected_beam_type()
+    if beam_type == BeamType.SIMPLE:
+        sections.append(
+            {
+                "title": "Middle Section",
+                "moment_label": "Mu_max (kg-m)",
+                "moment_key": "positive_mu_kgm",
+                "tension_prefix": "pb_tens",
+                "compression_prefix": "pb_comp",
+                "tension_caption": "Bottom reinforcement.",
+                "compression_caption": "Top reinforcement.",
+            }
+        )
+        sections.append(
+            {
+                "title": "Support Section",
+                "moment_label": "Mu, support - L/4 (kg-m)",
+                "moment_key": "support_mu_kgm",
+                "moment_mode_key": "support_mu_mode",
+                "moment_mode_auto_note": "Auto-calculated from the simple beam moment diagram at x/L = 0.25.",
+                "tension_prefix": "sb_tens",
+                "compression_prefix": "sb_comp",
+                "tension_caption": "Bottom reinforcement.",
+                "compression_caption": "Top reinforcement.",
+            }
+        )
+    elif beam_type != BeamType.STANDALONE_CANTILEVER:
+        sections.append(
+            {
+                "title": "Positive Section",
+                "moment_label": "Mu, positive (kg-m)",
+                "moment_key": "positive_mu_kgm",
+                "tension_prefix": "pb_tens",
+                "compression_prefix": "pb_comp",
+                "tension_caption": "Bottom reinforcement.",
+                "compression_caption": "Top reinforcement.",
+            }
+        )
+    if beam_type == BeamType.CONTINUOUS:
+        sections.append(
+            {
+                "title": "Negative Section",
+                "moment_label": "Mu, negative (kg-m)",
+                "moment_key": "negative_mu_kgm",
+                "tension_prefix": "nb_tens",
+                "compression_prefix": "nb_comp",
+                "tension_caption": "Top reinforcement.",
+                "compression_caption": "Bottom reinforcement.",
+            }
+        )
+    if beam_type == BeamType.STANDALONE_CANTILEVER or _selected_include_cantilever_span():
+        sections.append(
+            {
+                "title": "Cantilever Negative Section",
+                "moment_label": "Mu, cantilever negative (kg-m)",
+                "moment_key": "cantilever_negative_mu_kgm",
+                "tension_prefix": "cb_tens",
+                "compression_prefix": "cb_comp",
+                "tension_caption": "Top reinforcement.",
+                "compression_caption": "Bottom reinforcement.",
+            }
+        )
+    return [(f"{index}. {section['title']}", section) for index, section in enumerate(sections, start=5)]
+
 def _render_shear_inputs() -> None:
-    top_cols = st.columns(4 if st.session_state.include_torsion_design else 3, gap="medium")
-    with top_cols[0]:
-        st.markdown("<div class='input-field-label'>V<sub>u</sub> (kg)</div>", unsafe_allow_html=True)
-        st.number_input("Vu (kg)", min_value=0.0, step=50.0, key="vu_kg", label_visibility="collapsed")
-        _render_field_helper()
-    column_index = 1
+    beam_type = _selected_beam_type()
+    include_cantilever = _selected_include_cantilever_span()
+    vu_regions = _active_vu_region_specs(beam_type, include_cantilever)
+    for region_key, region_label, section_label in vu_regions:
+        st.markdown(f"<div class='section-label'>{region_label} &rarr; {section_label}</div>", unsafe_allow_html=True)
+        if region_key == "support":
+            st.number_input(region_label, min_value=0.0, step=50.0, key="support_vu_kg")
+        elif region_key in {"middle", "span_region"}:
+            st.radio(
+                f"{region_label} mode",
+                options=[mode.value for mode in DemandInputMode],
+                key="span_vu_mode",
+                horizontal=True,
+            )
+            st.number_input(
+                "Interior span position x/L",
+                min_value=0.25,
+                max_value=0.75,
+                step=0.05,
+                key="span_vu_position_ratio",
+            )
+            if st.session_state.span_vu_mode == DemandInputMode.MANUAL.value:
+                st.number_input(region_label, min_value=0.0, step=50.0, key="span_vu_kg")
+            else:
+                auto_vu = float(st.session_state.support_vu_kg) * abs(1.0 - (2.0 * float(st.session_state.span_vu_position_ratio)))
+                st.metric(f"Auto {region_label} (kg)", format_number(auto_vu))
+                st.caption("Auto-calculated from support Vu using uniform-load linear reduction.")
+        else:
+            st.number_input(region_label, min_value=0.0, step=50.0, key="cantilever_vu_kg")
+
+    top_cols = st.columns(3 if st.session_state.include_torsion_design else 2, gap="medium")
+    column_index = 0
     if st.session_state.include_torsion_design:
-        with top_cols[1]:
+        with top_cols[0]:
             st.markdown("<div class='input-field-label'>T<sub>u</sub> (kgf-m)</div>", unsafe_allow_html=True)
             st.number_input("Tu (kgf-m)", min_value=0.0, step=10.0, key="torsion_tu_kgfm", label_visibility="collapsed")
             _render_field_helper("Factored torsion")
-        column_index = 2
+        column_index = 1
     with top_cols[column_index]:
         st.markdown("<div class='input-field-label'>Stirrup diameter (mm)</div>", unsafe_allow_html=True)
         st.selectbox(
@@ -841,9 +1095,7 @@ def _render_deflection_section(preview_results) -> None:
 
 
 def _deflection_section_label(beam_type: BeamType) -> str:
-    if beam_type == BeamType.CONTINUOUS:
-        return "8. Deflection Check"
-    return "7. Deflection Check"
+    return f"{_deflection_section_number()}. Deflection Check"
 
 
 def _deflection_support_options_for_member_type(member_type_value: str) -> list[str]:
@@ -859,6 +1111,8 @@ def _deflection_support_options_for_member_type(member_type_value: str) -> list[
 
 
 def _deflection_member_type_options(beam_type: BeamType) -> list[str]:
+    if beam_type == BeamType.STANDALONE_CANTILEVER:
+        return [DeflectionMemberType.CANTILEVER_BEAM.value]
     if beam_type == BeamType.SIMPLE:
         return [DeflectionMemberType.SIMPLE_BEAM.value]
     return [DeflectionMemberType.CONTINUOUS_BEAM.value]
@@ -1613,12 +1867,25 @@ def _render_shear_header_feedback(preview_results) -> None:
     if preview_results is None:
         return
     shear = preview_results.shear
+    shear_regions = getattr(preview_results, "shear_regions", ())
     st.markdown(
         "<div class='design-banner info'>"
         f"Current shear &phi; factor = {format_ratio(shear.phi, 3)}."
         "</div>",
         unsafe_allow_html=True,
     )
+    if shear_regions:
+        mapping_lines = [
+            f"{region.region_label} -> {region.design_section_label} ({region.design_status})"
+            for region in shear_regions
+        ]
+        st.markdown(
+            "<div class='design-banner info'>"
+            f"Governing shear region: {shear.region_label} using {shear.design_section_label}. "
+            + " | ".join(mapping_lines)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
     st.markdown(
         "<div class='design-banner info'>"
         f"Av = {format_number(shear.av_cm2)} cm<sup>2</sup> | "
@@ -1875,6 +2142,127 @@ def render_key_metrics(inputs: BeamDesignInputSet, results, palette) -> None:
             deflection_metrics,
             palette,
         )
+        _render_overall_deflection_diagram(results)
+    overall_label = results.overall_status
+    if overall_label == "DOES NOT MEET REQUIREMENTS":
+        overall_label = "DOES NOT MEET DESIGN REQUIREMENTS"
+    st.markdown(overall_status_card_html(overall_label, "", palette), unsafe_allow_html=True)
+
+
+def render_summary_panel(inputs: BeamDesignInputSet, results, palette) -> None:
+    st.markdown("<div class='panel-card'>", unsafe_allow_html=True)
+    summary_section_number = 6 + len(inputs.active_flexural_sections)
+    if inputs.consider_deflection:
+        summary_section_number += 1
+    st.markdown(
+        f"<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;'>"
+        f"<div><div class='hero-title' style='font-size:1.25rem;'>{summary_section_number}. Overall Summary</div>"
+        f"<div class='hero-subtitle'>Live results update with every input change.</div></div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    summary_lines = [f"Beam Type: {inputs.beam_type.value}"]
+    if inputs.beam_type in {BeamType.SIMPLE, BeamType.CONTINUOUS}:
+        summary_lines.append(f"Include Cantilever Span: {'Yes' if inputs.include_cantilever_span else 'No'}")
+    summary_lines.append(f"Sections: {', '.join(label for _, label in inputs.active_flexural_sections)}")
+    for line in summary_lines:
+        st.markdown(f"<div class='design-banner info'>{line}</div>", unsafe_allow_html=True)
+    section_specs = beam_section_specs(inputs)
+    drawing_transform = shared_drawing_transform(inputs)
+    section_columns = st.columns(len(section_specs), gap="medium")
+    for column, (title, moment_case) in zip(section_columns, section_specs):
+        with column:
+            st.markdown(f"<div class='section-label'>{title} Section</div>", unsafe_allow_html=True)
+            st.markdown(build_beam_section_svg(inputs, palette, moment_case, transform=drawing_transform), unsafe_allow_html=True)
+            stirrup_spacing_cm = results.combined_shear_torsion.stirrup_spacing_cm if results.combined_shear_torsion.active else results.shear.provided_spacing_cm
+            rebar_details = build_section_rebar_details(inputs, moment_case, stirrup_spacing_cm)
+            st.markdown(_section_rebar_detail_html(rebar_details), unsafe_allow_html=True)
+    render_key_metrics(inputs, results, palette)
+    render_warnings_and_flags(results)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _flexural_metric_rows(flexural_result) -> list[tuple[str, object, str]]:
+    return [
+        ("Beam Behavior", flexural_result.beam_behavior_mode, _beam_behavior_summary_note(flexural_result)),
+        ("Auto Result", flexural_result.auto_result or "-", _beam_behavior_auto_note(flexural_result)),
+        ("R / Threshold", _beam_behavior_ratio_pair(flexural_result), "Contribution ratio / Auto threshold"),
+        ("M<sub>u</sub> / &phi;M<sub>n</sub>", capacity_ratio_html(flexural_result.ratio), "Moment capacity ratio"),
+        ("A<sub>s,req</sub>", format_number(flexural_result.as_required_cm2), "cm<sup>2</sup>"),
+        ("A<sub>s,prov</sub>", format_number(flexural_result.as_provided_cm2), flexural_result.as_status),
+        ("A<sub>s,min</sub> / A<sub>s,max</sub>", f"{format_number(flexural_result.as_min_cm2)} / {format_number(flexural_result.as_max_cm2)}", "cm<sup>2</sup>"),
+        ("&rho;", format_ratio(flexural_result.rho_provided), "Provided reinforcement ratio"),
+        ("&phi;M<sub>n</sub>", format_number(flexural_result.phi_mn_kgm), flexural_result.ratio_status),
+    ]
+
+
+def render_key_metrics(inputs: BeamDesignInputSet, results, palette) -> None:
+    st.markdown(capacity_ratio_legend_html(), unsafe_allow_html=True)
+    flexural_groups: list[tuple[str, object]] = []
+    if inputs.has_positive_design:
+        flexural_groups.append(("Positive Moment", results.positive_bending))
+    if inputs.has_support_negative_design and results.negative_bending is not None:
+        flexural_groups.append(("Negative Moment", results.negative_bending))
+    if inputs.has_cantilever_negative_design and results.cantilever_negative_bending is not None:
+        flexural_groups.append(("Cantilever Negative Moment", results.cantilever_negative_bending))
+    shear_metrics = [
+        ("V<sub>u</sub> / &phi;V<sub>n</sub>", capacity_ratio_html(results.shear.capacity_ratio), "Shear capacity ratio"),
+        ("V<sub>u</sub>", format_number(inputs.shear.factored_shear_kg), "kg"),
+        ("V<sub>n</sub>", format_number(results.shear.vn_kg), "kg"),
+        ("&phi;V<sub>n</sub>", format_number(results.shear.phi_vn_kg), results.shear.design_status),
+        ("&phi;V<sub>c</sub>", format_number(results.shear.phi_vc_kg), "kg"),
+        ("&phi;V<sub>s</sub>", format_number(results.shear.phi_vs_provided_kg), f"{results.shear.spacing_mode.value} spacing"),
+        ("s<sub>stirrup</sub>", format_number(results.shear.provided_spacing_cm), f"{results.shear.spacing_mode.value} | s<sub>req</sub> <= {format_number(results.shear.required_spacing_cm)} cm"),
+        ("Spacing check", results.beam_geometry.positive_tension_spacing.overall_status, "Positive tension layers"),
+    ]
+    combined_metrics: list[tuple[str, object, str]] = []
+    combined = results.combined_shear_torsion
+    if combined.active:
+        combined_metrics = [
+            ("Capacity Ratio (Shear + Torsion)", capacity_ratio_html(combined.capacity_ratio), "Combined required transverse reinforcement / provided transverse reinforcement"),
+            ("V<sub>u</sub>", format_number(combined.vu_kg), "kgf"),
+            ("T<sub>u</sub>", format_number(combined.tu_kgfm), "kgf-m"),
+            ("Section stress ratio", capacity_ratio_html(combined.cross_section_limit_ratio) if combined.cross_section_limit_check_applied else "-", combined.cross_section_limit_clause or "Combined section limit not applied"),
+            ("Req. transverse", f"{combined.combined_required_transverse_mm2_per_mm:.6f}", "mm<sup>2</sup>/mm"),
+            ("Prov. transverse", f"{combined.provided_transverse_mm2_per_mm:.6f}", "mm<sup>2</sup>/mm"),
+            ("Stirrups", f"&phi;{combined.stirrup_diameter_mm} mm / {combined.stirrup_legs} legs @ {format_number(combined.stirrup_spacing_cm)} cm", combined.design_status),
+            ("Pass / Fail", combined.design_status, "Shared closed stirrup check"),
+        ]
+    for group_title, flexural_result in flexural_groups:
+        chart_html = build_flexural_phi_chart_svg(
+            palette,
+            PhiFlexureChartState(
+                title=f"{group_title} Flexural Ï†",
+                design_code=inputs.metadata.design_code,
+                et=flexural_result.et,
+                ety=flexural_result.ety,
+                phi=flexural_result.phi,
+            ),
+        )
+        _render_metric_group(group_title, _flexural_metric_rows(flexural_result), palette, extra_html=chart_html)
+    if combined.active:
+        _render_metric_group("Shear & Torsion", combined_metrics, palette, extra_html=_build_shear_torsion_interaction_diagram_html(combined, palette, results.torsion))
+    else:
+        _render_metric_group("Shear", shear_metrics, palette)
+        if inputs.torsion.enabled and combined.torsion_ignored:
+            st.markdown(f"<div class='design-banner info'>{combined.ignore_message}</div>", unsafe_allow_html=True)
+        elif inputs.torsion.enabled:
+            torsion_metrics = [("T<sub>u</sub>", format_number(results.torsion.tu_kgfm), "kgf-m"), ("Threshold", format_number(results.torsion.threshold_torsion_kgfm), "kgf-m"), ("Status", results.torsion.status, _torsion_warning_summary(results.torsion))]
+            _render_metric_group("Torsion", torsion_metrics, palette)
+    if inputs.consider_deflection:
+        deflection_metrics = [
+            ("Ie method", results.deflection.ie_method_governing or results.deflection.ie_method_selected, results.deflection.ie_method_selected),
+            ("Allowable deflection", format_number(results.deflection.allowable_deflection_cm), "cm"),
+            ("Calculated deflection", format_number(results.deflection.calculated_deflection_cm), "cm"),
+            ("Capacity Ratio (Deflection)", capacity_ratio_html(results.deflection.capacity_ratio), "Calculated / Allowable"),
+            ("Immediate total", format_number(results.deflection.immediate_total_deflection_cm), "cm"),
+            ("Long-term additional", format_number(results.deflection.additional_long_term_deflection_cm), "cm"),
+            ("Pass / Fail", results.deflection.status, results.deflection.pass_fail_summary or results.deflection.note),
+        ]
+        if results.deflection.method_2_total_service_deflection_cm is not None:
+            deflection_metrics.insert(3, ("Method 1", format_number(results.deflection.method_1_total_service_deflection_cm), "cm"))
+            deflection_metrics.insert(4, ("Method 2", format_number(results.deflection.method_2_total_service_deflection_cm), "cm"))
+        _render_metric_group("Deflection", deflection_metrics, palette)
         _render_overall_deflection_diagram(results)
     overall_label = results.overall_status
     if overall_label == "DOES NOT MEET REQUIREMENTS":
@@ -2153,6 +2541,7 @@ def build_inputs_from_state() -> BeamDesignInputSet:
     resolved_deflection_ie_method = _resolved_deflection_ie_method_from_state()
     return BeamDesignInputSet(
         beam_type=BeamType(st.session_state.beam_type),
+        include_cantilever_span=bool(st.session_state.get("include_cantilever_span", False)),
         beam_behavior_mode=BeamBehaviorMode(st.session_state.beam_behavior_mode),
         auto_beam_behavior_threshold_ratio=_clamp_beam_behavior_threshold_ratio(
             float(st.session_state.auto_beam_behavior_threshold_percent) / 100.0
@@ -2196,8 +2585,19 @@ def build_inputs_from_state() -> BeamDesignInputSet:
             compression_reinforcement=_build_arrangement_from_state("pb_comp"),
             tension_reinforcement=_build_arrangement_from_state("pb_tens"),
         ),
+        simple_support_bending=SimpleSupportBendingInput(
+            moment_mode=DemandInputMode(st.session_state.get("support_mu_mode", DemandInputMode.AUTO.value)),
+            factored_moment_kgm=float(st.session_state.get("support_mu_kgm", 0.0)),
+            compression_reinforcement=_build_arrangement_from_state("sb_comp"),
+            tension_reinforcement=_build_arrangement_from_state("sb_tens"),
+        ),
         shear=ShearDesignInput(
-            factored_shear_kg=float(st.session_state.vu_kg),
+            factored_shear_kg=float(st.session_state.get("support_vu_kg", st.session_state.vu_kg)),
+            support_factored_shear_kg=float(st.session_state.get("support_vu_kg", st.session_state.vu_kg)),
+            span_region_factored_shear_kg=float(st.session_state.get("span_vu_kg", st.session_state.get("support_vu_kg", st.session_state.vu_kg))),
+            cantilever_factored_shear_kg=float(st.session_state.get("cantilever_vu_kg", st.session_state.get("support_vu_kg", st.session_state.vu_kg))),
+            span_region_mode=DemandInputMode(st.session_state.get("span_vu_mode", DemandInputMode.AUTO.value)),
+            span_region_relative_position=float(st.session_state.get("span_vu_position_ratio", 0.25)),
             stirrup_diameter_mm=_resolved_diameter_value("stirrup_diameter_option", "stirrup_diameter_mm", allow_empty=False),
             legs_per_plane=int(st.session_state.legs_per_plane),
             spacing_mode=ShearSpacingMode(st.session_state.shear_spacing_mode),
@@ -2224,6 +2624,11 @@ def build_inputs_from_state() -> BeamDesignInputSet:
             factored_moment_kgm=float(st.session_state.negative_mu_kgm),
             compression_reinforcement=_build_arrangement_from_state("nb_comp"),
             tension_reinforcement=_build_arrangement_from_state("nb_tens"),
+        ),
+        cantilever_negative_bending=NegativeBendingInput(
+            factored_moment_kgm=float(st.session_state.cantilever_negative_mu_kgm),
+            compression_reinforcement=_build_arrangement_from_state("cb_comp"),
+            tension_reinforcement=_build_arrangement_from_state("cb_tens"),
         ),
         deflection=DeflectionCheckInput(
             design_code=_deflection_design_code_from_main_code(DesignCode(st.session_state.design_code)),
@@ -2284,10 +2689,84 @@ def _selected_beam_type() -> BeamType:
     return BeamType(st.session_state.beam_type)
 
 
+def _beam_type_ui_options() -> list[str]:
+    return [
+        BeamType.SIMPLE.value,
+        BeamType.CONTINUOUS.value,
+        BeamType.STANDALONE_CANTILEVER.value,
+    ]
+
+
+def _selected_include_cantilever_span() -> bool:
+    if _selected_beam_type() not in {BeamType.SIMPLE, BeamType.CONTINUOUS}:
+        return False
+    return bool(st.session_state.get("include_cantilever_span", False))
+
+
+def _active_flexural_section_specs_from_state() -> list[tuple[str, str]]:
+    return _active_flexural_section_specs(_selected_beam_type(), _selected_include_cantilever_span())
+
+
+def _active_flexural_section_specs(beam_type: BeamType, include_cantilever_span: bool) -> list[tuple[str, str]]:
+    if beam_type == BeamType.STANDALONE_CANTILEVER:
+        return [("Cantilever Negative Section", "cantilever_negative")]
+    if beam_type == BeamType.SIMPLE:
+        sections = [
+            ("Middle Section", "middle"),
+            ("Support Section", "support"),
+        ]
+        if include_cantilever_span:
+            sections.append(("Cantilever Negative Section", "cantilever_negative"))
+        return sections
+    sections = [
+        ("Positive Section", "positive"),
+        ("Negative Section", "negative"),
+    ]
+    if include_cantilever_span:
+        sections.append(("Cantilever Negative Section", "cantilever_negative"))
+    return sections
+
+
+def _shear_section_number() -> int:
+    return _shear_section_number_for(_selected_beam_type(), _selected_include_cantilever_span())
+
+
+def _shear_section_number_for(beam_type: BeamType, include_cantilever_span: bool) -> int:
+    return 5 + len(_active_flexural_section_specs(beam_type, include_cantilever_span))
+
+
+def _active_vu_region_specs(beam_type: BeamType, include_cantilever_span: bool) -> list[tuple[str, str, str]]:
+    if beam_type == BeamType.STANDALONE_CANTILEVER:
+        return [("cantilever", "Cantilever Vu", "Cantilever Negative Section")]
+    if beam_type == BeamType.SIMPLE:
+        regions = [
+            ("support", "Support Vu", "Support Section"),
+            ("middle", "Middle-region Vu", "Middle Section"),
+        ]
+        if include_cantilever_span:
+            regions.append(("cantilever", "Cantilever Vu", "Cantilever Negative Section"))
+        return regions
+    regions = [
+        ("support", "Support Vu", "Negative Section"),
+        ("span_region", "Span-region Vu", "Positive Section"),
+    ]
+    if include_cantilever_span:
+        regions.append(("cantilever", "Cantilever Vu", "Cantilever Negative Section"))
+    return regions
+
+
+def _deflection_section_number() -> int:
+    return _shear_section_number() + 1
+
+
 def _shear_design_section_label(include_torsion: bool, beam_type: BeamType) -> str:
+    include_cantilever_span = False
+    if "include_cantilever_span" in st.session_state:
+        include_cantilever_span = bool(st.session_state.get("include_cantilever_span", False))
+    section_number = _shear_section_number_for(beam_type, include_cantilever_span if beam_type in {BeamType.SIMPLE, BeamType.CONTINUOUS} else False)
     if include_torsion:
-        return "7. Shear & Torsion Design" if beam_type == BeamType.CONTINUOUS else "6. Shear & Torsion Design"
-    return "7. Shear Design" if beam_type == BeamType.CONTINUOUS else "6. Shear Design"
+        return f"{section_number}. Shear & Torsion Design"
+    return f"{section_number}. Shear Design"
 
 
 def _torsion_detail_inputs_required(preview_results) -> bool:

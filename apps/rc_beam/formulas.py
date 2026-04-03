@@ -49,10 +49,12 @@ from .models import (
     BeamDesignResults,
     BeamGeometryInput,
     BeamGeometryResults,
+    BeamType,
     CombinedShearTorsionResults,
     DeflectionCheckInput,
     DeflectionCheckResults,
     DesignCode,
+    DemandInputMode,
     FlexuralDesignResults,
     LayerSpacingResult,
     MaterialPropertiesInput,
@@ -139,10 +141,52 @@ def calculate_beam_geometry(
     return _to_app_beam_geometry_results(engine_results)
 
 
-def calculate_positive_bending_design(
+def _positive_style_bending_input(negative_bending: NegativeBendingInput) -> PositiveBendingInput:
+    return PositiveBendingInput(
+        factored_moment_kgm=negative_bending.factored_moment_kgm,
+        compression_reinforcement=negative_bending.compression_reinforcement,
+        tension_reinforcement=negative_bending.tension_reinforcement,
+    )
+
+
+def _resolved_simple_support_bending_input(design_inputs: BeamDesignInputSet) -> PositiveBendingInput:
+    return PositiveBendingInput(
+        factored_moment_kgm=design_inputs.resolved_simple_support_moment_kgm,
+        compression_reinforcement=design_inputs.simple_support_bending.compression_reinforcement,
+        tension_reinforcement=design_inputs.simple_support_bending.tension_reinforcement,
+    )
+
+
+def _resolve_primary_geometry_inputs(
+    design_inputs: BeamDesignInputSet,
+) -> tuple[PositiveBendingInput, NegativeBendingInput, bool]:
+    if design_inputs.has_positive_design:
+        positive_bending = design_inputs.positive_bending
+    else:
+        positive_bending = _positive_style_bending_input(design_inputs.cantilever_negative_bending)
+    negative_bending = design_inputs.negative_bending if design_inputs.has_support_negative_design else NegativeBendingInput()
+    return positive_bending, negative_bending, design_inputs.has_support_negative_design
+
+
+def _section_depth_from_positive_style_input(
+    geometry: BeamGeometryInput,
+    section_bending: PositiveBendingInput,
+    shear: ShearDesignInput,
+) -> float:
+    geometry_results = calculate_beam_geometry(
+        geometry,
+        section_bending,
+        NegativeBendingInput(),
+        shear,
+        include_negative=False,
+    )
+    return geometry_results.d_plus_cm
+
+
+def _calculate_positive_oriented_bending_design(
     materials: MaterialPropertiesInput,
     geometry: BeamGeometryInput,
-    positive_bending: PositiveBendingInput,
+    section_bending: PositiveBendingInput,
     design_inputs: BeamDesignInputSet,
 ) -> FlexuralDesignResults:
     engine_results = design_moment_beam(
@@ -151,9 +195,9 @@ def calculate_positive_bending_design(
             materials=_to_engine_materials(materials),
             geometry=_to_engine_geometry(geometry),
             stirrup_diameter_mm=design_inputs.shear.stirrup_diameter_mm,
-            factored_moment_kgm=positive_bending.factored_moment_kgm,
-            positive_compression_reinforcement=_to_engine_reinforcement(positive_bending.compression_reinforcement),
-            positive_tension_reinforcement=_to_engine_reinforcement(positive_bending.tension_reinforcement),
+            factored_moment_kgm=section_bending.factored_moment_kgm,
+            positive_compression_reinforcement=_to_engine_reinforcement(section_bending.compression_reinforcement),
+            positive_tension_reinforcement=_to_engine_reinforcement(section_bending.tension_reinforcement),
             negative_compression_reinforcement=_to_engine_reinforcement(design_inputs.negative_bending.compression_reinforcement),
             negative_tension_reinforcement=_to_engine_reinforcement(design_inputs.negative_bending.tension_reinforcement),
             material_settings=_to_engine_material_settings(design_inputs.material_settings),
@@ -163,7 +207,7 @@ def calculate_positive_bending_design(
     material_results = calculate_material_properties(materials, design_inputs.material_settings)
     geometry_results = calculate_beam_geometry(
         geometry,
-        design_inputs.positive_bending,
+        section_bending,
         design_inputs.negative_bending,
         design_inputs.shear,
         include_negative=design_inputs.has_negative_design,
@@ -173,13 +217,195 @@ def calculate_positive_bending_design(
         design_inputs=design_inputs,
         material_results=material_results,
         geometry_results=geometry_results,
-        tension_reinforcement=positive_bending.tension_reinforcement,
-        compression_reinforcement=positive_bending.compression_reinforcement,
-        factored_moment_kgm=positive_bending.factored_moment_kgm,
+        tension_reinforcement=section_bending.tension_reinforcement,
+        compression_reinforcement=section_bending.compression_reinforcement,
+        factored_moment_kgm=section_bending.factored_moment_kgm,
         effective_depth_cm=geometry_results.d_plus_cm,
         compression_depth_cm=geometry_results.positive_compression_centroid_d_prime_cm,
         compression_face="top",
     )
+
+
+def _positive_style_bending_for_section(
+    design_inputs: BeamDesignInputSet,
+    section_key: str,
+) -> PositiveBendingInput:
+    if section_key == "support":
+        return _resolved_simple_support_bending_input(design_inputs)
+    if section_key in {"middle", "positive"}:
+        return design_inputs.positive_bending
+    if section_key == "negative":
+        return _positive_style_bending_input(design_inputs.negative_bending)
+    if section_key == "cantilever_negative":
+        return _positive_style_bending_input(design_inputs.cantilever_negative_bending)
+    return design_inputs.positive_bending
+
+
+def _resolve_span_region_shear(
+    shear: ShearDesignInput,
+) -> tuple[float, bool, str]:
+    if shear.span_region_mode == DemandInputMode.AUTO:
+        reduction_ratio = abs(1.0 - (2.0 * shear.span_region_relative_position))
+        factored_shear_kg = shear.resolved_support_factored_shear_kg * reduction_ratio
+        return (
+            factored_shear_kg,
+            True,
+            (
+                "Auto-calculated from support Vu using uniform-load linear shear reduction "
+                f"at x/L = {shear.span_region_relative_position:.2f}."
+            ),
+        )
+    return (
+        shear.resolved_span_region_factored_shear_kg,
+        False,
+        f"Manual span-region shear at x/L = {shear.span_region_relative_position:.2f}.",
+    )
+
+
+def _resolve_shear_region_demands(
+    design_inputs: BeamDesignInputSet,
+    shear: ShearDesignInput,
+) -> tuple[tuple[str, str, str, str, float, bool, str], ...]:
+    demands: list[tuple[str, str, str, str, float, bool, str]] = []
+    span_region_vu_kg, span_region_auto, span_region_note = _resolve_span_region_shear(shear)
+    for region_key, region_label, section_key, section_label in design_inputs.active_vu_region_mappings:
+        if region_key == "support":
+            demands.append(
+                (
+                    region_key,
+                    region_label,
+                    section_key,
+                    section_label,
+                    shear.resolved_support_factored_shear_kg,
+                    False,
+                    "Support-region shear demand.",
+                )
+            )
+        elif region_key in {"middle", "span_region"}:
+            demands.append(
+                (
+                    region_key,
+                    region_label,
+                    section_key,
+                    section_label,
+                    span_region_vu_kg,
+                    span_region_auto,
+                    span_region_note,
+                )
+            )
+        else:
+            demands.append(
+                (
+                    region_key,
+                    region_label,
+                    section_key,
+                    section_label,
+                    shear.resolved_cantilever_factored_shear_kg,
+                    False,
+                    "Cantilever-region shear demand.",
+                )
+            )
+    return tuple(demands)
+
+
+def _calculate_shear_design_for_region(
+    materials: MaterialPropertiesInput,
+    geometry: BeamGeometryInput,
+    shear: ShearDesignInput,
+    design_inputs: BeamDesignInputSet,
+    *,
+    region_key: str,
+    region_label: str,
+    section_key: str,
+    section_label: str,
+    factored_shear_kg: float,
+    auto_calculated: bool,
+    location_note: str,
+) -> ShearDesignResults:
+    design_section_bending = _positive_style_bending_for_section(design_inputs, section_key)
+    effective_depth_cm = _section_depth_from_positive_style_input(geometry, design_section_bending, shear)
+    region_shear = replace(shear, factored_shear_kg=factored_shear_kg)
+    engine_results = design_shear_beam(
+        ShearBeamInput(
+            design_code=_to_engine_design_code(design_inputs.metadata.design_code),
+            materials=_to_engine_materials(materials),
+            geometry=_to_engine_geometry(geometry),
+            factored_shear_kg=region_shear.factored_shear_kg,
+            stirrup_diameter_mm=region_shear.stirrup_diameter_mm,
+            legs_per_plane=region_shear.legs_per_plane,
+            spacing_mode=_to_engine_shear_spacing_mode(region_shear.spacing_mode),
+            provided_spacing_cm=region_shear.provided_spacing_cm,
+            positive_compression_reinforcement=_to_engine_reinforcement(design_section_bending.compression_reinforcement),
+            positive_tension_reinforcement=_to_engine_reinforcement(design_section_bending.tension_reinforcement),
+            negative_compression_reinforcement=_to_engine_reinforcement(ReinforcementArrangementInput()),
+            negative_tension_reinforcement=_to_engine_reinforcement(ReinforcementArrangementInput()),
+            include_negative_geometry=False,
+        )
+    )
+    return replace(
+        _to_app_shear_results(engine_results),
+        region_key=region_key,
+        region_label=region_label,
+        input_factored_shear_kg=factored_shear_kg,
+        auto_calculated=auto_calculated,
+        location_note=location_note,
+        design_section_key=section_key,
+        design_section_label=section_label,
+        effective_depth_cm=effective_depth_cm,
+    )
+
+
+def calculate_shear_design_regions(
+    materials: MaterialPropertiesInput,
+    geometry: BeamGeometryInput,
+    shear: ShearDesignInput,
+    design_inputs: BeamDesignInputSet,
+) -> tuple[ShearDesignResults, tuple[ShearDesignResults, ...]]:
+    region_results = tuple(
+        _calculate_shear_design_for_region(
+            materials,
+            geometry,
+            shear,
+            design_inputs,
+            region_key=region_key,
+            region_label=region_label,
+            section_key=section_key,
+            section_label=section_label,
+            factored_shear_kg=factored_shear_kg,
+            auto_calculated=auto_calculated,
+            location_note=location_note,
+        )
+        for region_key, region_label, section_key, section_label, factored_shear_kg, auto_calculated, location_note in _resolve_shear_region_demands(
+            design_inputs,
+            shear,
+        )
+    )
+    if not region_results:
+        fallback = _calculate_shear_design_for_region(
+            materials,
+            geometry,
+            shear,
+            design_inputs,
+            region_key="support",
+            region_label="Support Vu",
+            section_key="positive",
+            section_label="Positive Section",
+            factored_shear_kg=shear.factored_shear_kg,
+            auto_calculated=False,
+            location_note="Fallback shear region.",
+        )
+        return fallback, (fallback,)
+    governing = max(region_results, key=lambda result: result.capacity_ratio)
+    return governing, region_results
+
+
+def calculate_positive_bending_design(
+    materials: MaterialPropertiesInput,
+    geometry: BeamGeometryInput,
+    positive_bending: PositiveBendingInput,
+    design_inputs: BeamDesignInputSet,
+) -> FlexuralDesignResults:
+    return _calculate_positive_oriented_bending_design(materials, geometry, positive_bending, design_inputs)
 
 
 def calculate_shear_design(
@@ -188,27 +414,39 @@ def calculate_shear_design(
     shear: ShearDesignInput,
     design_inputs: BeamDesignInputSet,
 ) -> ShearDesignResults:
-    engine_results = design_shear_beam(
-        ShearBeamInput(
-            design_code=_to_engine_design_code(design_inputs.metadata.design_code),
-            materials=_to_engine_materials(materials),
-            geometry=_to_engine_geometry(geometry),
-            factored_shear_kg=shear.factored_shear_kg,
-            stirrup_diameter_mm=shear.stirrup_diameter_mm,
-            legs_per_plane=shear.legs_per_plane,
-            spacing_mode=_to_engine_shear_spacing_mode(shear.spacing_mode),
-            provided_spacing_cm=shear.provided_spacing_cm,
-            positive_compression_reinforcement=_to_engine_reinforcement(design_inputs.positive_bending.compression_reinforcement),
-            positive_tension_reinforcement=_to_engine_reinforcement(design_inputs.positive_bending.tension_reinforcement),
-            negative_compression_reinforcement=_to_engine_reinforcement(design_inputs.negative_bending.compression_reinforcement),
-            negative_tension_reinforcement=_to_engine_reinforcement(design_inputs.negative_bending.tension_reinforcement),
-            include_negative_geometry=design_inputs.has_negative_design,
-        )
-    )
-    return _to_app_shear_results(engine_results)
+    governing_result, _ = calculate_shear_design_regions(materials, geometry, shear, design_inputs)
+    return governing_result
 
 
 def calculate_negative_bending_design(
+    materials: MaterialPropertiesInput,
+    geometry: BeamGeometryInput,
+    negative_bending: NegativeBendingInput,
+    design_inputs: BeamDesignInputSet,
+) -> FlexuralDesignResults:
+    return _calculate_negative_oriented_bending_design(
+        materials,
+        geometry,
+        negative_bending,
+        design_inputs,
+    )
+
+
+def calculate_cantilever_negative_bending_design(
+    materials: MaterialPropertiesInput,
+    geometry: BeamGeometryInput,
+    cantilever_negative_bending: NegativeBendingInput,
+    design_inputs: BeamDesignInputSet,
+) -> FlexuralDesignResults:
+    return _calculate_negative_oriented_bending_design(
+        materials,
+        geometry,
+        cantilever_negative_bending,
+        design_inputs,
+    )
+
+
+def _calculate_negative_oriented_bending_design(
     materials: MaterialPropertiesInput,
     geometry: BeamGeometryInput,
     negative_bending: NegativeBendingInput,
@@ -233,9 +471,9 @@ def calculate_negative_bending_design(
     geometry_results = calculate_beam_geometry(
         geometry,
         design_inputs.positive_bending,
-        design_inputs.negative_bending,
+        negative_bending,
         design_inputs.shear,
-        include_negative=design_inputs.has_negative_design,
+        include_negative=True,
     )
     if geometry_results.d_minus_cm is None or geometry_results.negative_compression_centroid_from_bottom_cm is None:
         return _to_app_moment_results(engine_results)
@@ -253,16 +491,41 @@ def calculate_negative_bending_design(
     )
 
 
+def _resolve_deflection_member_configuration(
+    design_inputs: BeamDesignInputSet,
+) -> tuple[EngineDeflectionMemberType, EngineDeflectionSupportCondition]:
+    if design_inputs.beam_type == BeamType.STANDALONE_CANTILEVER:
+        return (
+            EngineDeflectionMemberType.CANTILEVER_BEAM,
+            EngineDeflectionSupportCondition.CANTILEVER_PLACEHOLDER,
+        )
+    if design_inputs.beam_type == BeamType.CONTINUOUS:
+        if design_inputs.deflection.support_condition in {
+            EngineDeflectionSupportCondition.CONTINUOUS_2_SPANS,
+            EngineDeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS,
+        }:
+            return (EngineDeflectionMemberType.CONTINUOUS_BEAM, design_inputs.deflection.support_condition)
+        return (
+            EngineDeflectionMemberType.CONTINUOUS_BEAM,
+            EngineDeflectionSupportCondition.CONTINUOUS_2_SPANS,
+        )
+    return (
+        EngineDeflectionMemberType.SIMPLE_BEAM,
+        EngineDeflectionSupportCondition.SIMPLE,
+    )
+
+
 def calculate_deflection_check(
     design_inputs: BeamDesignInputSet,
     material_results: MaterialResults,
     geometry_results: BeamGeometryResults,
 ) -> DeflectionCheckResults:
+    resolved_member_type, resolved_support_condition = _resolve_deflection_member_configuration(design_inputs)
     beam_self_weight_dead_load_kgf_per_m = (
         (design_inputs.geometry.width_cm / 100.0) * (design_inputs.geometry.depth_cm / 100.0) * 2400.0
     )
     support_section = None
-    if design_inputs.deflection.support_condition in {
+    if resolved_support_condition in {
         EngineDeflectionSupportCondition.CONTINUOUS_2_SPANS,
         EngineDeflectionSupportCondition.CONTINUOUS_3_OR_MORE_SPANS,
     }:
@@ -278,8 +541,8 @@ def calculate_deflection_check(
     engine_results = design_deflection_check(
         EngineDeflectionDesignInput(
             code_version=design_inputs.deflection.design_code,
-            member_type=design_inputs.deflection.member_type,
-            support_condition=design_inputs.deflection.support_condition,
+            member_type=resolved_member_type,
+            support_condition=resolved_support_condition,
             ie_method=design_inputs.deflection.ie_method,
             allowable_limit=design_inputs.deflection.allowable_limit,
             span_length_m=design_inputs.deflection.span_length_m,
@@ -323,23 +586,32 @@ def validate_spacing_warnings(
     geometry: BeamGeometryInput,
     positive_bending: PositiveBendingInput,
     negative_bending: NegativeBendingInput,
+    cantilever_negative_bending: NegativeBendingInput,
     shear: ShearDesignInput,
+    simple_support_bending,
     *,
+    include_positive: bool,
+    include_simple_support: bool,
     include_negative: bool,
+    include_cantilever_negative: bool,
 ) -> list[str]:
     warning_messages: list[str] = []
-    spacing_groups: dict[str, ReinforcementSpacingResults] = {
-        "Positive compression": calculate_reinforcement_spacing(
-            geometry,
-            positive_bending.compression_reinforcement,
-            shear.stirrup_diameter_mm,
-        ),
-        "Positive tension": calculate_reinforcement_spacing(
-            geometry,
-            positive_bending.tension_reinforcement,
-            shear.stirrup_diameter_mm,
-        ),
-    }
+    spacing_groups: dict[str, ReinforcementSpacingResults] = {}
+    if include_positive:
+        spacing_groups.update(
+            {
+                "Positive compression": calculate_reinforcement_spacing(
+                    geometry,
+                    positive_bending.compression_reinforcement,
+                    shear.stirrup_diameter_mm,
+                ),
+                "Positive tension": calculate_reinforcement_spacing(
+                    geometry,
+                    positive_bending.tension_reinforcement,
+                    shear.stirrup_diameter_mm,
+                ),
+            }
+        )
     if include_negative:
         spacing_groups.update(
             {
@@ -351,6 +623,36 @@ def validate_spacing_warnings(
                 "Negative tension": calculate_reinforcement_spacing(
                     geometry,
                     negative_bending.tension_reinforcement,
+                    shear.stirrup_diameter_mm,
+                ),
+            }
+        )
+    if include_simple_support:
+        spacing_groups.update(
+            {
+                "Support compression": calculate_reinforcement_spacing(
+                    geometry,
+                    simple_support_bending.compression_reinforcement,
+                    shear.stirrup_diameter_mm,
+                ),
+                "Support tension": calculate_reinforcement_spacing(
+                    geometry,
+                    simple_support_bending.tension_reinforcement,
+                    shear.stirrup_diameter_mm,
+                ),
+            }
+        )
+    if include_cantilever_negative:
+        spacing_groups.update(
+            {
+                "Cantilever negative compression": calculate_reinforcement_spacing(
+                    geometry,
+                    cantilever_negative_bending.compression_reinforcement,
+                    shear.stirrup_diameter_mm,
+                ),
+                "Cantilever negative tension": calculate_reinforcement_spacing(
+                    geometry,
+                    cantilever_negative_bending.tension_reinforcement,
                     shear.stirrup_diameter_mm,
                 ),
             }
@@ -370,25 +672,59 @@ def validate_reinforcement_area_warnings(
     geometry: BeamGeometryInput,
     positive_bending: PositiveBendingInput,
     negative_bending: NegativeBendingInput,
+    cantilever_negative_bending: NegativeBendingInput,
     design_inputs: BeamDesignInputSet,
+    simple_support_bending,
     *,
+    include_positive: bool,
+    include_simple_support: bool,
     include_negative: bool,
+    include_cantilever_negative: bool,
 ) -> list[str]:
     warning_messages: list[str] = []
-    positive_results = calculate_positive_bending_design(materials, geometry, positive_bending, design_inputs)
     as_clause = _flexural_as_clause_reference(design_inputs.metadata.design_code)
 
-    if positive_results.as_status != "OK":
-        warning_messages.append(
-            "Positive bending reinforcement does not satisfy the required reinforcement area limits. "
-            f"{_format_aci_warning_reference(as_clause)}. This does not satisfy the A_s limit requirements."
-        )
+    if include_positive:
+        positive_results = calculate_positive_bending_design(materials, geometry, positive_bending, design_inputs)
+        if positive_results.as_status != "OK":
+            warning_messages.append(
+                "Positive bending reinforcement does not satisfy the required reinforcement area limits. "
+                f"{_format_aci_warning_reference(as_clause)}. This does not satisfy the A_s limit requirements."
+            )
 
     if include_negative:
         negative_results = calculate_negative_bending_design(materials, geometry, negative_bending, design_inputs)
         if negative_results.as_status != "OK":
             warning_messages.append(
                 "Negative bending reinforcement does not satisfy the required reinforcement area limits. "
+                f"{_format_aci_warning_reference(as_clause)}. This does not satisfy the A_s limit requirements."
+            )
+    if include_simple_support:
+        support_results = _calculate_positive_oriented_bending_design(
+            materials,
+            geometry,
+            PositiveBendingInput(
+                factored_moment_kgm=design_inputs.resolved_simple_support_moment_kgm,
+                compression_reinforcement=simple_support_bending.compression_reinforcement,
+                tension_reinforcement=simple_support_bending.tension_reinforcement,
+            ),
+            design_inputs,
+        )
+        if support_results.as_status != "OK":
+            warning_messages.append(
+                "Support bending reinforcement does not satisfy the required reinforcement area limits. "
+                f"{_format_aci_warning_reference(as_clause)}. This does not satisfy the A_s limit requirements."
+            )
+    if include_cantilever_negative:
+        cantilever_results = calculate_cantilever_negative_bending_design(
+            materials,
+            geometry,
+            cantilever_negative_bending,
+            design_inputs,
+        )
+        if cantilever_results.as_status != "OK":
+            warning_messages.append(
+                "Cantilever negative bending reinforcement does not satisfy the required reinforcement area limits. "
                 f"{_format_aci_warning_reference(as_clause)}. This does not satisfy the A_s limit requirements."
             )
     return warning_messages
@@ -406,7 +742,7 @@ def validate_shear_warnings(
             f"{shear_results.section_change_note.rstrip('.')} "
             f"{_format_aci_warning_reference(shear_reinf_clause)}. This exceeds the permitted shear reinforcement contribution."
         )
-    if shear_results.phi_vn_kg < design_inputs.shear.factored_shear_kg and not shear_results.section_change_required:
+    if shear_results.phi_vn_kg < shear_results.input_factored_shear_kg and not shear_results.section_change_required:
         warning_messages.append(
             "Shear strength is insufficient because the applied shear force exceeds the design shear capacity, V_u > phi V_n. "
             f"{_format_aci_warning_reference(shear_strength_clause)}. This does not satisfy the beam shear strength requirements."
@@ -475,7 +811,7 @@ def _compose_combined_shear_torsion_results(
             active=False,
             torsion_ignored=False,
             ignore_message="",
-            vu_kg=design_inputs.shear.factored_shear_kg,
+            vu_kg=shear_results.input_factored_shear_kg,
             tu_kgfm=design_inputs.torsion.factored_torsion_kgfm,
             shear_required_transverse_mm2_per_mm=0.0,
             torsion_required_transverse_mm2_per_mm=0.0,
@@ -502,7 +838,7 @@ def _compose_combined_shear_torsion_results(
             active=False,
             torsion_ignored=True,
             ignore_message=ignore_message,
-            vu_kg=design_inputs.shear.factored_shear_kg,
+            vu_kg=shear_results.input_factored_shear_kg,
             tu_kgfm=design_inputs.torsion.factored_torsion_kgfm,
             shear_required_transverse_mm2_per_mm=0.0,
             torsion_required_transverse_mm2_per_mm=0.0,
@@ -520,7 +856,7 @@ def _compose_combined_shear_torsion_results(
             design_status_note="",
         )
 
-    d_mm = geometry_results.d_plus_cm * 10.0
+    d_mm = shear_results.effective_depth_cm * 10.0
     # Convert the shear demand to the same shared-stirrup basis used elsewhere in this block: mm2/mm.
     # fy is entered in kgf/cm2, so the raw Av/s result is first obtained in cm2/mm and then converted to mm2/mm.
     shear_required_transverse_mm2_per_mm = _safe_divide(
@@ -607,7 +943,7 @@ def _compose_combined_shear_torsion_results(
         active=True,
         torsion_ignored=False,
         ignore_message="",
-        vu_kg=design_inputs.shear.factored_shear_kg,
+        vu_kg=shear_results.input_factored_shear_kg,
         tu_kgfm=design_inputs.torsion.factored_torsion_kgfm,
         shear_required_transverse_mm2_per_mm=shear_required_transverse_mm2_per_mm,
         torsion_required_transverse_mm2_per_mm=torsion_required_transverse_mm2_per_mm,
@@ -634,14 +970,18 @@ def _compose_combined_shear_torsion_results(
 
 
 def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesignResults:
-    include_negative = design_inputs.has_negative_design
+    include_negative = design_inputs.has_support_negative_design
+    include_simple_support = design_inputs.has_simple_support_design
+    include_simple_support_checks = include_simple_support and design_inputs.resolved_simple_support_moment_kgm > 1e-9
+    include_cantilever_negative = design_inputs.has_cantilever_negative_design
     material_results = calculate_material_properties(design_inputs.materials, design_inputs.material_settings)
+    geometry_positive_bending, geometry_negative_bending, include_negative_geometry = _resolve_primary_geometry_inputs(design_inputs)
     geometry_results = calculate_beam_geometry(
         design_inputs.geometry,
-        design_inputs.positive_bending,
-        design_inputs.negative_bending,
+        geometry_positive_bending,
+        geometry_negative_bending,
         design_inputs.shear,
-        include_negative=include_negative,
+        include_negative=include_negative_geometry,
     )
     positive_results = calculate_positive_bending_design(
         design_inputs.materials,
@@ -649,7 +989,15 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
         design_inputs.positive_bending,
         design_inputs,
     )
-    shear_results = calculate_shear_design(
+    support_results = None
+    if include_simple_support:
+        support_results = _calculate_positive_oriented_bending_design(
+            design_inputs.materials,
+            design_inputs.geometry,
+            _resolved_simple_support_bending_input(design_inputs),
+            design_inputs,
+        )
+    shear_results, shear_region_results = calculate_shear_design_regions(
         design_inputs.materials,
         design_inputs.geometry,
         design_inputs.shear,
@@ -681,14 +1029,12 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
             torsion_results,
         )
         if abs(resolved_shared_spacing_cm - shear_results.provided_spacing_cm) > 1e-9:
-            adjusted_shear = ShearDesignInput(
-                factored_shear_kg=design_inputs.shear.factored_shear_kg,
-                stirrup_diameter_mm=design_inputs.shear.stirrup_diameter_mm,
-                legs_per_plane=design_inputs.shear.legs_per_plane,
+            adjusted_shear = replace(
+                design_inputs.shear,
                 spacing_mode=ShearSpacingMode.MANUAL,
                 provided_spacing_cm=resolved_shared_spacing_cm,
             )
-            shear_results = calculate_shear_design(
+            shear_results, shear_region_results = calculate_shear_design_regions(
                 design_inputs.materials,
                 design_inputs.geometry,
                 adjusted_shear,
@@ -726,6 +1072,14 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
             design_inputs.negative_bending,
             design_inputs,
         )
+    cantilever_negative_results = None
+    if include_cantilever_negative:
+        cantilever_negative_results = calculate_cantilever_negative_bending_design(
+            design_inputs.materials,
+            design_inputs.geometry,
+            design_inputs.cantilever_negative_bending,
+            design_inputs,
+        )
     deflection_results = (
         calculate_deflection_check(
             design_inputs,
@@ -740,16 +1094,26 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
             design_inputs.geometry,
             design_inputs.positive_bending,
             design_inputs.negative_bending,
+            design_inputs.cantilever_negative_bending,
             design_inputs.shear,
+            simple_support_bending=design_inputs.simple_support_bending,
+            include_positive=design_inputs.has_positive_design,
+            include_simple_support=include_simple_support_checks,
             include_negative=include_negative,
+            include_cantilever_negative=include_cantilever_negative,
         ),
         *validate_reinforcement_area_warnings(
             design_inputs.materials,
             design_inputs.geometry,
             design_inputs.positive_bending,
             design_inputs.negative_bending,
+            design_inputs.cantilever_negative_bending,
             design_inputs,
+            simple_support_bending=design_inputs.simple_support_bending,
+            include_positive=design_inputs.has_positive_design,
+            include_simple_support=include_simple_support_checks,
             include_negative=include_negative,
+            include_cantilever_negative=include_cantilever_negative,
         ),
         *validate_shear_warnings(design_inputs, shear_results),
         *validate_torsion_warnings(torsion_results),
@@ -762,10 +1126,12 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
         design_inputs,
         geometry_results,
         positive_results,
+        support_results if include_simple_support_checks else None,
         shear_results,
         torsion_results,
         combined_shear_torsion_results,
         negative_results,
+        cantilever_negative_results,
         deflection_results,
         review_flags,
     )
@@ -773,10 +1139,13 @@ def calculate_full_design_results(design_inputs: BeamDesignInputSet) -> BeamDesi
         materials=material_results,
         beam_geometry=geometry_results,
         positive_bending=positive_results,
+        support_bending=support_results,
         shear=shear_results,
+        shear_regions=shear_region_results,
         torsion=torsion_results,
         combined_shear_torsion=combined_shear_torsion_results,
         negative_bending=negative_results,
+        cantilever_negative_bending=cantilever_negative_results,
         deflection=deflection_results,
         warnings=warnings,
         review_flags=review_flags,
@@ -1273,19 +1642,25 @@ def _calculate_overall_assessment(
     design_inputs: BeamDesignInputSet,
     geometry_results: BeamGeometryResults,
     positive_results: FlexuralDesignResults,
+    support_results: FlexuralDesignResults | None,
     shear_results: ShearDesignResults,
     torsion_results: TorsionDesignResults,
     combined_shear_torsion_results: CombinedShearTorsionResults,
     negative_results: FlexuralDesignResults | None,
+    cantilever_negative_results: FlexuralDesignResults | None,
     deflection_results: DeflectionCheckResults,
     review_flags: list[ReviewFlag],
 ) -> tuple[str, str]:
     strength_failures: list[str] = []
-    if positive_results.ratio_status != "OK":
+    if design_inputs.has_positive_design and positive_results.ratio_status != "OK":
         strength_failures.append("Positive flexural strength does not satisfy M_u <= phi M_n.")
+    if support_results is not None and support_results.ratio_status != "OK":
+        strength_failures.append("Support flexural strength does not satisfy M_u <= phi M_n.")
     if negative_results is not None and negative_results.ratio_status != "OK":
         strength_failures.append("Negative flexural strength does not satisfy M_u <= phi M_n.")
-    if shear_results.phi_vn_kg < design_inputs.shear.factored_shear_kg:
+    if cantilever_negative_results is not None and cantilever_negative_results.ratio_status != "OK":
+        strength_failures.append("Cantilever negative flexural strength does not satisfy M_u <= phi M_n.")
+    if shear_results.phi_vn_kg < shear_results.input_factored_shear_kg:
         if shear_results.section_change_required and shear_results.section_change_note:
             strength_failures.append(shear_results.section_change_note)
         else:
@@ -1303,18 +1678,55 @@ def _calculate_overall_assessment(
         return "FAIL", " ".join(strength_failures)
 
     requirement_issues: list[str] = []
-    if positive_results.as_status != "OK":
+    if design_inputs.has_positive_design and positive_results.as_status != "OK":
         requirement_issues.append("Positive tension reinforcement does not satisfy the required A_s limits.")
+    if support_results is not None and support_results.as_status != "OK":
+        requirement_issues.append("Support tension reinforcement does not satisfy the required A_s limits.")
     if negative_results is not None and negative_results.as_status != "OK":
         requirement_issues.append("Negative tension reinforcement does not satisfy the required A_s limits.")
-    spacing_results = [
-        geometry_results.positive_tension_spacing,
-        geometry_results.positive_compression_spacing,
-    ]
+    if cantilever_negative_results is not None and cantilever_negative_results.as_status != "OK":
+        requirement_issues.append("Cantilever negative tension reinforcement does not satisfy the required A_s limits.")
+    spacing_results: list[ReinforcementSpacingResults] = []
+    if design_inputs.has_positive_design:
+        spacing_results.extend(
+            [
+                geometry_results.positive_tension_spacing,
+                geometry_results.positive_compression_spacing,
+            ]
+        )
+    if design_inputs.has_simple_support_design:
+        spacing_results.extend(
+            [
+                calculate_reinforcement_spacing(
+                    design_inputs.geometry,
+                    design_inputs.simple_support_bending.tension_reinforcement,
+                    design_inputs.shear.stirrup_diameter_mm,
+                ),
+                calculate_reinforcement_spacing(
+                    design_inputs.geometry,
+                    design_inputs.simple_support_bending.compression_reinforcement,
+                    design_inputs.shear.stirrup_diameter_mm,
+                ),
+            ]
+        )
     if geometry_results.negative_tension_spacing is not None:
         spacing_results.append(geometry_results.negative_tension_spacing)
     if geometry_results.negative_compression_spacing is not None:
         spacing_results.append(geometry_results.negative_compression_spacing)
+    if design_inputs.has_cantilever_negative_design:
+        cantilever_spacing_results = [
+            calculate_reinforcement_spacing(
+                design_inputs.geometry,
+                design_inputs.cantilever_negative_bending.tension_reinforcement,
+                design_inputs.shear.stirrup_diameter_mm,
+            ),
+            calculate_reinforcement_spacing(
+                design_inputs.geometry,
+                design_inputs.cantilever_negative_bending.compression_reinforcement,
+                design_inputs.shear.stirrup_diameter_mm,
+            ),
+        ]
+        spacing_results.extend(cantilever_spacing_results)
     if any(spacing_result.overall_status != "OK" for spacing_result in spacing_results):
         requirement_issues.append("One or more reinforcement layers do not satisfy the minimum clear spacing requirement.")
     if shear_results.review_note:
@@ -1614,7 +2026,7 @@ def _combined_required_transverse_mm2_per_mm(
     shear_results: ShearDesignResults,
     torsion_results: TorsionDesignResults,
 ) -> float:
-    d_mm = geometry_results.d_plus_cm * 10.0
+    d_mm = shear_results.effective_depth_cm * 10.0
     # Keep the shear component on the same mm2/mm basis as the torsion component for shared-stirrup interaction.
     shear_required_transverse_mm2_per_mm = _safe_divide(
         shear_results.nominal_vs_required_kg,
@@ -1662,14 +2074,14 @@ def _evaluate_combined_shear_torsion_cross_section_limit(
         return (False, 0.0, 0.0, 0.0, 0.0, 0.0, "", True)
 
     width_cm = design_inputs.geometry.width_cm
-    d_cm = geometry_results.d_plus_cm
+    d_cm = shear_results.effective_depth_cm
     if width_cm <= 0.0 or d_cm <= 0.0:
         return (False, 0.0, 0.0, 0.0, 0.0, 0.0, "", True)
 
     # ACI 318-14/19/25 22.7.7.1 combines the solid-section shear stress from Vu
     # with the torsional stress from Tu using an RSS stress limit. The current
     # beam app scope is a solid rectangular section using the same d basis as shear.
-    shear_stress_mpa = ksc_to_mpa(_safe_divide(design_inputs.shear.factored_shear_kg, width_cm * d_cm))
+    shear_stress_mpa = ksc_to_mpa(_safe_divide(shear_results.input_factored_shear_kg, width_cm * d_cm))
     vc_stress_mpa = ksc_to_mpa(_safe_divide(shear_results.vc_kg, width_cm * d_cm))
     tu_nmm = kgf_m_to_n_mm(design_inputs.torsion.factored_torsion_kgfm)
     torsion_stress_mpa = tu_nmm * torsion_results.ph_mm / (1.7 * (torsion_results.aoh_mm2**2))

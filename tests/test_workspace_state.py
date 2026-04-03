@@ -924,9 +924,45 @@ def test_torsion_demand_type_info_text_keeps_conservative_guidance() -> None:
 
 
 def test_shear_design_section_label_switches_to_combined_mode_when_torsion_is_enabled() -> None:
-    assert workspace_page._shear_design_section_label(False, BeamType.SIMPLE) == "6. Shear Design"
-    assert workspace_page._shear_design_section_label(True, BeamType.SIMPLE) == "6. Shear & Torsion Design"
+    assert workspace_page._shear_design_section_label(False, BeamType.SIMPLE) == "7. Shear Design"
+    assert workspace_page._shear_design_section_label(True, BeamType.SIMPLE) == "7. Shear & Torsion Design"
     assert workspace_page._shear_design_section_label(True, BeamType.CONTINUOUS) == "7. Shear & Torsion Design"
+
+
+def test_active_flexural_section_specs_support_cantilever_mappings() -> None:
+    assert workspace_page._active_flexural_section_specs(BeamType.STANDALONE_CANTILEVER, False) == [
+        ("Cantilever Negative Section", "cantilever_negative")
+    ]
+    assert workspace_page._active_flexural_section_specs(BeamType.SIMPLE, False) == [
+        ("Middle Section", "middle"),
+        ("Support Section", "support"),
+    ]
+    assert workspace_page._active_flexural_section_specs(BeamType.SIMPLE, True) == [
+        ("Middle Section", "middle"),
+        ("Support Section", "support"),
+        ("Cantilever Negative Section", "cantilever_negative"),
+    ]
+    assert workspace_page._active_flexural_section_specs(BeamType.CONTINUOUS, False) == [
+        ("Positive Section", "positive"),
+        ("Negative Section", "negative"),
+    ]
+    assert workspace_page._active_flexural_section_specs(BeamType.CONTINUOUS, True) == [
+        ("Positive Section", "positive"),
+        ("Negative Section", "negative"),
+        ("Cantilever Negative Section", "cantilever_negative"),
+    ]
+
+
+def test_active_vu_region_specs_show_support_before_middle_for_simple_beam() -> None:
+    assert workspace_page._active_vu_region_specs(BeamType.SIMPLE, False) == [
+        ("support", "Support Vu", "Support Section"),
+        ("middle", "Middle-region Vu", "Middle Section"),
+    ]
+    assert workspace_page._active_vu_region_specs(BeamType.SIMPLE, True) == [
+        ("support", "Support Vu", "Support Section"),
+        ("middle", "Middle-region Vu", "Middle Section"),
+        ("cantilever", "Cantilever Vu", "Cantilever Negative Section"),
+    ]
 
 
 def test_torsion_detail_inputs_are_hidden_when_torsion_can_be_ignored() -> None:
